@@ -16,9 +16,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # --- КЭШ ДЛЯ VCPKG ---
+      # Восстанавливаем кэш
       - name: Restore vcpkg cache
-        uses: actions/cache@v4
+        id: cache-vcpkg
+        uses: actions/cache/restore@v4
         with:
           path: |
             vcpkg
@@ -27,33 +28,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-vcpkg-ffmpeg-
 
-      # --- КЭШ ДЛЯ CARGO ---
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
       - name: Install vcpkg (if not cached)
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          if [ ! -d "vcpkg" ]; then
-            git clone https://github.com/microsoft/vcpkg.git
-            ./vcpkg/bootstrap-vcpkg.bat
-          fi
+          git clone https://github.com/microsoft/vcpkg.git
+          ./vcpkg/bootstrap-vcpkg.bat
 
       - name: Install FFmpeg via vcpkg
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: |
           ./vcpkg/vcpkg.exe install ffmpeg:x64-windows
+
+      # СОХРАНЯЕМ КЭШ СРАЗУ ПОСЛЕ СБОРКИ FFMPEG
+      - name: Save vcpkg cache
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            vcpkg
+            ~/AppData/Local/vcpkg/archives
+          key: ${{ runner.os }}-vcpkg-ffmpeg-${{ hashFiles('vcpkg/ports/ffmpeg/portfile.cmake') }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Set FFmpeg Environment Variables
         shell: bash
         run: |
           VCPKG_ROOT=$(pwd)/vcpkg
           echo "FFMPEG_DIR=$VCPKG_ROOT/installed/x64-windows" >> $GITHUB_ENV
-          # Добавляем путь к бинарникам в PATH, чтобы тесты или сборка их видели
           echo "$VCPKG_ROOT/installed/x64-windows/bin" >> $GITHUB_PATH
 
       - name: Build Receiver
+        # Явно указываем компилировать ТОЛЬКО ресивер, игнорируя остальной проект
         run: |
-          cargo build --release --bin receiver
+          cargo build --release --package receiver --bin receiver
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
