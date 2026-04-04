@@ -55,7 +55,7 @@ jobs:
 
       # 6. Собираем только ресивер
       - name: Build Receiver
-        run: cargo build --release --bin receiver
+        run: cargo build --release
 
       # 7. Выгружаем результат
       - name: Upload Artifact
