@@ -63,7 +63,7 @@ jobs:
       - name: Build Receiver
         # Явно указываем компилировать ТОЛЬКО ресивер, игнорируя остальной проект
         run: |
-          cargo build --release --package receiver --bin receiver
+          cargo build --release --bin receiver
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
