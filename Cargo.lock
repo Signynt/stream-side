@@ -2178,6 +2178,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "receiver"
+version = "0.1.0"
+dependencies = [
+ "ashpd",
+ "bytemuck",
+ "ffmpeg-next",
+ "libc",
+ "pipewire",
+ "pollster",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2465,6 +2483,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d767eb0aabc880b29956c35734170f26ed551a859dbd361d140cdbeca61ab1e2"
 
 [[package]]
+name = "sender"
+version = "0.1.0"
+dependencies = [
+ "ashpd",
+ "bytemuck",
+ "ffmpeg-next",
+ "libc",
+ "pipewire",
+ "pollster",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "tokio",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2644,24 +2680,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "streamcapture"
-version = "0.1.0"
-dependencies = [
- "ashpd",
- "bytemuck",
- "ffmpeg-next",
- "libc",
- "pipewire",
- "pollster",
- "quinn",
- "rcgen",
- "rustls",
- "tokio",
- "wgpu",
- "winit",
-]
 
 [[package]]
 name = "strict-num"
