@@ -10,12 +10,13 @@ unsafe extern "C" {}
 use std::ffi::CString;
 use std::ptr;
 use std::sync::{Arc, Mutex};
+use std::net::ToSocketAddrs;
 
 use jni::{
     objects::{JClass, JObject, JString},
-    sys::{jint, jobject},
-    JNIEnv,
-    EnvOutcome
+    sys::{jint},
+    EnvUnowned,
+    Env
 };
 use once_cell::sync::OnceCell;
 
@@ -25,6 +26,7 @@ use super::{BackendError, FrameOutput, VideoBackend};
 // Глобальный синглтон бекенда
 // ─────────────────────────────────────────────────────────────────────────────
 static BACKEND: OnceCell<Arc<Mutex<AndroidMediaCodecBackend>>> = OnceCell::new();
+static NETWORK_RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
 
 fn get_or_create_backend() -> Arc<Mutex<AndroidMediaCodecBackend>> {
     BACKEND
@@ -79,28 +81,34 @@ impl AndroidMediaCodecBackend {
         self.shutdown();
 
         let mime   = CString::new("video/hevc").unwrap();
-        let codec  = ndk_sys::AMediaCodec_createDecoderByType(mime.as_ptr());
+        let codec  = unsafe { ndk_sys::AMediaCodec_createDecoderByType(mime.as_ptr()) };
+
         if codec.is_null() {
             return Err(BackendError::ConfigError(
                 "AMediaCodec_createDecoderByType(video/hevc) returned null.".into()
             ));
-        }
-
-        let format = ndk_sys::AMediaFormat_new();
+        } 
+    
+        let format = unsafe { ndk_sys::AMediaFormat_new() };
 
         macro_rules! fmt_str {
             ($k:expr, $v:expr) => {{
                 let k = CString::new($k).unwrap();
                 let v = CString::new($v).unwrap();
-                ndk_sys::AMediaFormat_setString(format, k.as_ptr(), v.as_ptr());
+                unsafe {
+                    ndk_sys::AMediaFormat_setString(format, k.as_ptr(), v.as_ptr());
+                }
             }};
         }
         macro_rules! fmt_i32 {
             ($k:expr, $v:expr) => {{
                 let k = CString::new($k).unwrap();
-                ndk_sys::AMediaFormat_setInt32(format, k.as_ptr(), $v);
+                unsafe {
+                    ndk_sys::AMediaFormat_setInt32(format, k.as_ptr(), $v);
+                }
             }};
         }
+        
 
         fmt_str!("mime",              "video/hevc");
         fmt_i32!("width",             width);
@@ -111,21 +119,21 @@ impl AndroidMediaCodecBackend {
         fmt_i32!("priority",          0);
         fmt_i32!("operating-rate",    60);
 
-        let status = ndk_sys::AMediaCodec_configure(
+        let status = unsafe { ndk_sys::AMediaCodec_configure(
             codec, format, native_window, ptr::null_mut(), 0,
-        );
-        ndk_sys::AMediaFormat_delete(format);
+        )};
+        unsafe { ndk_sys::AMediaFormat_delete(format) };
 
         if status != ndk_sys::media_status_t(0) {
-            ndk_sys::AMediaCodec_delete(codec);
+            unsafe { ndk_sys::AMediaCodec_delete(codec) };
             return Err(BackendError::ConfigError(
                 format!("AMediaCodec_configure failed with status={status:?}")
             ));
         }
 
-        let status = ndk_sys::AMediaCodec_start(codec);
+        let status = unsafe { ndk_sys::AMediaCodec_start(codec) };
         if status != ndk_sys::media_status_t(0) {
-            ndk_sys::AMediaCodec_delete(codec);
+            unsafe { ndk_sys::AMediaCodec_delete(codec) };
             return Err(BackendError::ConfigError(
                 format!("AMediaCodec_start failed with status={status:?}")
             ));
@@ -243,34 +251,76 @@ pub extern "C" fn Java_com_example_streamreceiver_NativeLib_initBackend(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking(
-    mut _env: jni::JNIEnv, // Используем правильный тип JNIEnv
+#[allow(improper_ctypes_definitions)]
+pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking<'local>(
+    mut unowned_env: EnvUnowned<'local>,
     _class: JClass,
-    _unused_host: JString, // Игнорируем, так как мы сервер
+    host: JString,
     port: jint,
 ) {
-    let _ = std::panic::catch_unwind(|| {
-        let backend = get_or_create_backend();
+    let host_str = unowned_env
+        .with_env(|env: &mut Env| env.get_string(&host).map(String::from))
+        .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
 
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-            rt.block_on(async move {
-                // Сервер всегда слушает на 0.0.0.0
-                let addr_str = format!("0.0.0.0:{}", port);
-                match addr_str.parse() {
-                    Ok(addr) => {
-                        log::info!("[Network] Starting QUIC server on {}", addr_str);
-                        // Запускаем ресивер (сервер) без канала (frame_tx = None)
-                        if let Err(e) = crate::network::run_quic_receiver(backend, addr, None).await {
-                            log::error!("[Network] Server error: {}", e);
-                        }
-                    }
-                    Err(e) => log::error!("[Network] Invalid bind address {}: {}", addr_str, e),
+    let backend = get_or_create_backend();
+ 
+    std::thread::spawn(move || {
+        // Останавливаем предыдущий runtime если он ещё жив
+        stop_networking_inner();
+ 
+        let addr_str = format!("{}:{}", host_str, port);
+        let addr = match addr_str.to_socket_addrs() {
+            Ok(mut iter) => match iter.next() {
+                Some(addr) => addr,
+                None => {
+                    log::error!("[Network] Не найден IP для {}", addr_str);
+                    return;
+                }
+            },
+            Err(e) => {
+                log::error!("[Network] Ошибка резолва {}: {}", addr_str, e);
+                return;
+            }
+        };
+ 
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let handle = rt.handle().clone();
+ 
+        // Сохраняем runtime ПЕРЕД block_on — чтобы stopNetworking мог его убить
+        *NETWORK_RT.lock().unwrap() = Some(rt);
+ 
+        log::info!("[Network] Подключаемся к {}", addr);
+ 
+        // catch_unwind: shutdown_background() прерывает block_on паникой
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle.block_on(async move {
+                // run_quic_receiver — бесконечный reconnect-loop
+                // frame_tx = None: кадры рендерятся прямо в Surface
+                if let Err(e) = crate::network::run_quic_receiver(backend, addr, None).await {
+                    log::error!("[Network] Fatal: {}", e);
                 }
             });
-        });
+        }));
+ 
+        // Чистим статик после завершения (штатного или через stop)
+        *NETWORK_RT.lock().unwrap() = None;
+        log::info!("[Network] Networking thread exited");
     });
 }
+ 
+/// Остановить QUIC-клиент и освободить tokio runtime.
+/// Вызывается из Kotlin при нажатии "Отключить" или из surfaceDestroyed.
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_example_streamreceiver_NativeLib_stopNetworking(
+    _env:   *mut jni::sys::JNIEnv,
+    _class: JClass,
+) {
+    let _ = std::panic::catch_unwind(|| {
+        stop_networking_inner();
+        log::info!("[JNI] stopNetworking OK");
+    });
+}
+
 
 #[unsafe(no_mangle)]
 pub extern "C" fn Java_com_example_streamreceiver_NativeLib_shutdownBackend(
@@ -283,4 +333,10 @@ pub extern "C" fn Java_com_example_streamreceiver_NativeLib_shutdownBackend(
             log::info!("[JNI] shutdownBackend OK");
         }
     });
+}
+
+fn stop_networking_inner() {
+    if let Some(rt) = NETWORK_RT.lock().unwrap().take() {
+        rt.shutdown_background(); // не блокирует вызывающий поток
+    }
 }

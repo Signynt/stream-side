@@ -10,6 +10,7 @@ pub mod network;
 // Android-инициализация логгера выполняется при загрузке библиотеки
 #[cfg(target_os = "android")]
 #[allow(non_snake_case)]
+#[allow(improper_ctypes_definitions)]
 #[unsafe(no_mangle)]
 pub extern "C" fn JNI_OnLoad(
     _vm: jni::JavaVM,

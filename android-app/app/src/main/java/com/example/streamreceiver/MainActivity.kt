@@ -7,41 +7,39 @@ import android.view.SurfaceView
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.activity.enableEdgeToEdge
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 
-// Разрешение, которое мы ожидаем от sender-а.
-// В реальном приложении согласовывается через сигнальный протокол.
 private const val STREAM_WIDTH  = 1920
 private const val STREAM_HEIGHT = 1080
-private const val SENDER_HOST   = "192.168.1.5"  // IP ПК с запущенным sender-ом
-private const val SENDER_PORT   = 4433
 
 class MainActivity : ComponentActivity() {
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Не гасить экран пока приложение активно
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
-        windowInsetsController.systemBarsBehavior = 
-            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        windowInsetsController.hide(WindowInsetsCompat.Type.systemBars())
-
-        window.attributes.layoutInDisplayCutoutMode = 
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            hide(WindowInsetsCompat.Type.systemBars())
+        }
+        window.attributes.layoutInDisplayCutoutMode =
             WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+
         setContent {
             MaterialTheme {
                 StreamReceiverScreen()
@@ -52,97 +50,143 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun StreamReceiverScreen() {
-    var statusText by remember { mutableStateOf("Ожидание Surface...") }
+    // ── Состояние ────────────────────────────────────────────────────────────
+    var host        by remember { mutableStateOf("192.168.1.100") }
+    var port        by remember { mutableStateOf("4433") }
+    var isConnected by remember { mutableStateOf(false) }
+    var statusText  by remember { mutableStateOf("") }
 
+    // Автоскрывать статусную плашку через 3 секунды
     LaunchedEffect(statusText) {
-        if (statusText.startsWith("Подключено")) {
-            kotlinx.coroutines.delay(3000) // Ждем 3 секунды
-            statusText = "" // Очищаем текст
+        if (statusText.isNotEmpty()) {
+            kotlinx.coroutines.delay(3_000)
+            statusText = ""
         }
     }
 
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        // ── SurfaceView через AndroidView ────────────────────────────────
+    Box(modifier = Modifier.fillMaxSize()) {
+
+        // ── SurfaceView (всегда на заднем слое) ──────────────────────────────
         //
-        // Мы используем SurfaceView (а не TextureView), потому что:
-        // 1. SurfaceView имеет выделенный оконный слой (dedicated window layer),
-        //    что позволяет аппаратному кодеку рисовать напрямую, минуя GPU-композитинг.
-        // 2. TextureView всегда идёт через SurfaceTexture → OpenGL-текстура → GPU-compose,
-        //    добавляя ~1-2 кадра задержки.
-        // 3. SurfaceView — минимальная задержка отображения для MediaCodec.
+        // SurfaceView, а не TextureView: аппаратный кодек рендерит напрямую
+        // в выделенный оконный слой, минуя GPU-композитинг. ~1-2 кадра меньше задержки.
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory  = { context ->
-                SurfaceView(context).also { surfaceView ->
-                    surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
+                SurfaceView(context).also { sv ->
+                    sv.holder.addCallback(object : SurfaceHolder.Callback {
 
                         override fun surfaceCreated(holder: SurfaceHolder) {
-                            // Surface готов — инициализируем Rust MediaCodec backend.
-                            //
-                            // holder.surface — это объект android.view.Surface,
-                            // который Rust конвертирует в ANativeWindow через JNI.
-                            // ANativeWindow_fromSurface увеличивает ref-count нативного
-                            // окна, поэтому Surface-объект на Java стороне может быть
-                            // безопасно GC'd после этого вызова.
-                            NativeLib.initBackend(
-                                surface = holder.surface,
-                                width   = STREAM_WIDTH,
-                                height  = STREAM_HEIGHT,
-                            )
-
-                            // Запускаем QUIC-клиент в фоновом потоке Rust
-                            NativeLib.startNetworking(
-                                host = SENDER_HOST,
-                                port = SENDER_PORT,
-                            )
-
-                            statusText = "Подключено к $SENDER_HOST:$SENDER_PORT"
-
+                            // Инициализируем декодер — подключение запускается отдельно кнопкой
+                            NativeLib.initBackend(holder.surface, STREAM_WIDTH, STREAM_HEIGHT)
                         }
 
                         override fun surfaceChanged(
-                            holder:  SurfaceHolder,
-                            format:  Int,
-                            width:   Int,
-                            height:  Int,
+                            holder: SurfaceHolder, format: Int, width: Int, height: Int,
                         ) {
-                            // Surface изменил размер (поворот экрана и т.п.).
-                            // MediaCodec с adaptive-playback=1 справится без перезапуска.
-                            // Если adaptive playback не поддерживается — нужна реинициализация:
-                            //   NativeLib.shutdownBackend()
-                            //   NativeLib.initBackend(holder.surface, width, height)
+                            // adaptive-playback=1 справится с изменением размера без перезапуска
                         }
 
                         override fun surfaceDestroyed(holder: SurfaceHolder) {
-                            // КРИТИЧНО: вызвать ДО выхода из этого callback'а!
-                            //
-                            // Платформа уничтожит Surface сразу после возврата из
-                            // surfaceDestroyed. Если к тому моменту Rust-код ещё
-                            // держит ANativeWindow и пытается писать в него —
-                            // это undefined behavior в NDK.
-                            //
-                            // shutdownBackend() вызывает AMediaCodec_stop() +
-                            // AMediaCodec_delete() + ANativeWindow_release() в правильном порядке.
+                            // КРИТИЧНО: остановить ВСЁ до выхода из callback'а!
+                            // После возврата платформа уничтожает Surface — UB если Rust ещё пишет в него.
                             NativeLib.shutdownBackend()
-                            statusText = "Surface уничтожен"
+                            isConnected = false
+                            statusText  = "Surface уничтожен"
                         }
                     })
                 }
             }
         )
+
+        // ── Форма подключения (показывается когда не подключены) ─────────────
+        if (!isConnected) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.55f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Card(
+                    modifier  = Modifier.width(320.dp),
+                    elevation = CardDefaults.cardElevation(8.dp),
+                ) {
+                    Column(
+                        modifier            = Modifier.padding(24.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Text(
+                            text  = "Подключение к sender'у",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+
+                        OutlinedTextField(
+                            value         = host,
+                            onValueChange = { host = it },
+                            label         = { Text("IP адрес") },
+                            placeholder   = { Text("192.168.1.100") },
+                            singleLine    = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                            modifier      = Modifier.fillMaxWidth(),
+                        )
+
+                        OutlinedTextField(
+                            value         = port,
+                            onValueChange = { v -> if (v.all { it.isDigit() } && v.length <= 5) port = v },
+                            label         = { Text("Порт") },
+                            singleLine    = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier      = Modifier.fillMaxWidth(),
+                        )
+
+                        Button(
+                            onClick  = {
+                                val portInt = port.toIntOrNull() ?: 4433
+                                NativeLib.startNetworking(host, portInt)
+                                isConnected = true
+                                statusText  = "Подключение к $host:$portInt..."
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled  = host.isNotBlank() && port.isNotBlank(),
+                        ) {
+                            Text("Подключиться")
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Кнопка "Отключить" (показывается когда подключены) ───────────────
+        if (isConnected) {
+            Button(
+                onClick  = {
+                    NativeLib.stopNetworking()
+                    isConnected = false
+                    statusText  = "Отключено"
+                },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 16.dp, end = 16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                    contentColor   = MaterialTheme.colorScheme.onErrorContainer,
+                ),
+            ) {
+                Text("Отключить")
+            }
+        }
+
+        // ── Статусная плашка (снизу, автоскрывается через 3с) ────────────────
         if (statusText.isNotEmpty()) {
             Card(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 64.dp, start = 16.dp, end = 16.dp)
+                    .padding(bottom = 48.dp, start = 16.dp, end = 16.dp),
             ) {
                 Text(
-                    text = statusText,
-                    modifier = Modifier.padding(8.dp),
-                    style = MaterialTheme.typography.bodySmall,
+                    text     = statusText,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    style    = MaterialTheme.typography.bodySmall,
                 )
             }
         }

@@ -19,12 +19,6 @@ android {
         }
     }
 
-    buildTypes {
-        release {
-            minifyEnabled false
-        }
-    }
-
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -48,12 +42,27 @@ android {
         }
     }
 
+    def props = new Properties()
+    def propFile = file('../local.properties') // или просто 'local.properties', если файл в папке app
+    if (propFile.exists()) {
+        propFile.withInputStream { props.load(it) }
+    }
+
     signingConfigs {
         release {
             storeFile file("my-release-key.jks")
             storePassword props['release.store.password']
             keyAlias props['release.key.alias']
             keyPassword props['release.key.password']
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // 2. ПРИМЕНЯЕМ ПОДПИСЬ
+            signingConfig signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 }

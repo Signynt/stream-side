@@ -7,7 +7,7 @@ edition = "2024"
 common = { path = "../common" }
 tokio = { version = "1.50.0", features = ["full"] }
 ffmpeg-next = "8.1.0"
-quinn = "0.11.9"
+quinn = {version = "0.11.9", features = ["rustls"]}
 rustls = { version = "0.23.37", features = ["ring"] }
 rcgen = "0.14.7"
 wgpu = "29.0.1"

@@ -2,20 +2,24 @@
 //
 // Кроссплатформенный сетевой цикл приёма видеопотока.
 //
-// Этот файл ОДИНАКОВ для всех платформ — он ничего не знает о том,
-// как именно происходит декодирование и рендеринг. Всё, что он делает:
+// Receiver теперь — QUIC-КЛИЕНТ: подключается к sender'у (серверу).
 //
-//   1. Принимает QUIC-соединение
-//   2. Читает length-prefixed пакеты
-//   3. Десериализует VideoPacket через postcard
-//   4. Вызывает backend.push_encoded(payload, frame_id)
-//   5. Вызывает backend.poll_output() в цикле для дренажа
+// Поток исполнения:
 //
-// На десктопе результат poll_output() — YuvFrame — уходит в mpsc-канал
-// к рендер-потоку (winit loop).
-// На Android poll_output() вызывается исключительно для того, чтобы
-// releaseOutputBuffer отправил кадр в Surface; возвращаемое DirectToSurface
-// просто игнорируется.
+//   run_quic_receiver(sender_addr)
+//       │
+//       ├── reconnect loop
+//       │       │
+//       │       ├── endpoint.connect(sender_addr) → connection
+//       │       │
+//       │       └── connection.accept_uni() → RecvStream
+//       │               │
+//       │               └── handle_stream (читает пакеты в цикле до закрытия стрима)
+//       │                       │
+//       │                       ├── backend.push_encoded(payload)
+//       │                       └── backend.poll_output() → frame_tx или Surface
+//       │
+//       └── при потере соединения — пауза 2с → reconnect
 
 use std::error::Error;
 use std::net::SocketAddr;
@@ -23,58 +27,78 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use common::VideoPacket;
-use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{Endpoint};
+use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::DigitallySignedStruct;
+use tokio::time::timeout;
 
 use crate::backend::{FrameOutput, VideoBackend};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Точка входа (для обеих платформ)
+// Точка входа
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Запустить QUIC-ресивер.
+/// Запустить QUIC-клиент и подключиться к sender'у на `sender_addr`.
 ///
-/// - `backend`  — платформо-специфичный декодер, обёрнутый в `Arc<Mutex<>>`
-///               для безопасной передачи между потоками.
-/// - `frame_tx` — `Some(sender)` на десктопе (YUV-кадры идут в рендер),
-///               `None` на Android (кадры уходят в Surface, канал не нужен).
-/// - `addr`     — адрес сервера (sender'а на ПК): "192.168.1.5:4433"
+/// При потере соединения автоматически переподключается.
+///
+/// - `backend`   — платформо-специфичный декодер.
+/// - `sender_addr` — адрес QUIC-сервера (sender): "192.168.1.5:4433"
+/// - `frame_tx`  — `Some(tx)` на десктопе, `None` на Android.
 pub async fn run_quic_receiver<B: VideoBackend>(
-    backend:  Arc<Mutex<B>>,
-    addr:     SocketAddr,
-    frame_tx: Option<mpsc::SyncSender<crate::backend::YuvFrame>>,
-) -> Result<(), Box<dyn Error>> { // <--- ТЕПЕРЬ ВОЗВРАЩАЕМ RESULT
-    
+    backend:     Arc<Mutex<B>>,
+    sender_addr: SocketAddr,
+    frame_tx:    Option<mpsc::SyncSender<crate::backend::YuvFrame>>,
+) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
-    // 1. Извлекаем endpoint. Теперь ? работает, так как функция возвращает Result
-    let endpoint = build_quic_endpoint(addr)?;
+    let endpoint = build_quic_client_endpoint()?;
 
-    eprintln!("🚀 Ресивер запущен на {}", addr);
+    loop {
+        eprintln!("🔌 Подключаемся к sender'у {}...", sender_addr);
 
-    // 2. Принимаем соединения
-    while let Some(connecting) = endpoint.accept().await {
-        let backend_clone = backend.clone();
-        let frame_tx_clone = frame_tx.clone();
+        let connection = match endpoint.connect(sender_addr, "localhost") {
+            Ok(connecting) => {
+                match timeout(Duration::from_secs(5), connecting).await {
+                    Ok(Ok(conn)) => conn,
 
-        tokio::spawn(async move {
-            // 3. РАСПАКОВЫВАЕМ соединение (избавляемся от Result)
-            match connecting.await {
-                Ok(connection) => {
-                    log::info!("[QUIC] Connected: {}", connection.remote_address());
-                    
-                    // 4. Теперь вызываем accept_uni у чистой connection
-                    while let Ok(mut stream) = connection.accept_uni().await {
-                        log::debug!("[QUIC] New stream");
-                        handle_stream(&mut stream, backend_clone.clone(), frame_tx_clone.clone()).await;
+                    Ok(Err(e)) => {
+                        eprintln!("❌ Ошибка подключения к {sender_addr}: {e}");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    Err(_) => {
+                        eprintln!("⏱️ Таймаут подключения к {sender_addr}");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
                     }
                 }
-                Err(e) => log::error!("[QUIC] Handshake failed: {}", e),
             }
-        });
-    }
 
-    Ok(())
+            Err(e) => {
+                eprintln!("❌ connect() error: {e}");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+
+        eprintln!("✅ Подключились к {}!", connection.remote_address());
+
+        // Sender открывает uni-стримы и посылает в них данные.
+        // Нам нужно их принимать.
+        while let Ok(mut stream) = connection.accept_uni().await {
+            let backend_clone  = backend.clone();
+            let frame_tx_clone = frame_tx.clone();
+
+            tokio::spawn(async move {
+                handle_stream(&mut stream, backend_clone, frame_tx_clone).await;
+            });
+        }
+
+        eprintln!("⚠️  Соединение разорвано, переподключаемся через 2с...");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,31 +139,21 @@ async fn handle_stream<B: VideoBackend>(
             }
         };
 
-        // Логируем задержку каждые 60 кадров
-        if let Ok(elapsed) = packet.send_time.elapsed() {
-            if packet.frame_id % 60 == 0 {
-                log::info!(
-                    "Frame #{} | latency={}ms | size={}KB",
-                    packet.frame_id,
-                    elapsed.as_millis(),
-                    packet.payload.len() / 1024,
-                );
-            }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+        let latency = now.saturating_sub(packet.timestamp);
+        if packet.frame_id % 100 == 0 {
+            log::info!("[Latency] Frame #{} | Network + Queue: {}ms", packet.frame_id, latency);
         }
-
         // ── Передаём payload в декодер ────────────────────────────────────
-        //
-        // Блокируем мьютекс на минимальное время.
-        // На Android это занимает ~1-5 µs (копия данных в MediaCodec buffer).
-        // На десктопе — ~2-10 µs (копия в ffmpeg packet).
         {
             let mut b = backend.lock().unwrap();
 
             match b.push_encoded(&packet.payload, packet.frame_id) {
                 Ok(()) => {}
                 Err(crate::backend::BackendError::BufferFull) => {
-                    // Декодер перегружен — пропускаем кадр.
-                    // Это нормально при временных пиках нагрузки.
                     log::warn!("[Decoder] Buffer full, dropping frame #{}", packet.frame_id);
                     continue;
                 }
@@ -150,29 +164,15 @@ async fn handle_stream<B: VideoBackend>(
             }
 
             // ── Дренируем выходную очередь декодера ──────────────────────
-            //
-            // Декодер может иметь несколько кадров в очереди — дренируем все.
-            //
-            // Android: каждый вызов poll_output() с кадром вызывает
-            //          releaseOutputBuffer(render=true), что рендерит кадр в Surface.
-            //          Без этого цикла MediaCodec заблокируется после заполнения
-            //          своей выходной очереди.
-            //
-            // Desktop: YUV-кадры отправляются в канал рендер-потока.
             loop {
                 match b.poll_output() {
                     Ok(FrameOutput::Yuv(frame)) => {
                         if let Some(ref tx) = frame_tx {
-                            // try_send не блокирует: если очередь полна —
-                            // пропускаем, не задерживая сетевой поток
                             let _ = tx.try_send(frame);
                         }
-                        // Продолжаем дренировать
                     }
-                    Ok(FrameOutput::DirectToSurface) => {
-                        // Android: кадр отрендерен — продолжаем дренировать
-                    }
-                    Ok(FrameOutput::Pending) | Err(_) => break, // очередь пуста
+                    Ok(FrameOutput::DirectToSurface) => {}
+                    Ok(FrameOutput::Pending) | Err(_) => break,
                 }
             }
         } // мьютекс отпущен
@@ -180,50 +180,72 @@ async fn handle_stream<B: VideoBackend>(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QUIC endpoint с skip-verify TLS (для LAN / self-signed)
+// QUIC client endpoint (skip-verify для LAN / self-signed)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_quic_endpoint(addr: SocketAddr) -> Result<Endpoint, Box<dyn std::error::Error>> {
-    // В LAN-сценарии стриминга сервер использует self-signed сертификат.
-    // Для продакшна здесь должна быть реальная верификация.
-    let (cert, key) = generate_self_signed_cert().unwrap();
-    let mut server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key).unwrap();
+fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
+    // 1. Настройка TLS (уже есть)
+    let mut crypto = rustls::ClientConfig::builder_with_provider(
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .with_safe_default_protocol_versions()?
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+    .with_no_client_auth();
 
-    server_config.alpn_protocols = vec![b"video-stream".to_vec()];
+    crypto.alpn_protocols = vec![b"video-stream".to_vec()];
 
-    let quic_crypto = QuicServerConfig::try_from(server_config).unwrap();
-    let client_config = ServerConfig::with_crypto(Arc::new(quic_crypto));
+    // 2. Создаем транспортный конфиг
+    let mut transport_config = quinn::TransportConfig::default();
+    
+    // Устанавливаем агрессивные таймауты для LAN, чтобы не ждать по 30 секунд
+    transport_config.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
+    
+    // Пинг, чтобы соединение не отваливалось в простое
+    transport_config.keep_alive_interval(Some(Duration::from_secs(3)));
+    
+    // Если тестируешь через VPN/Tailscale, иногда полезно ограничить MTU
+    // transport_config.initial_mtu(1200); 
 
-    let endpoint = Endpoint::server(client_config, addr).unwrap();
+    let quic_crypto = QuicClientConfig::try_from(crypto)?;
+    
+    // 3. Собираем ClientConfig, объединяя крипту и транспорт
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    client_config.transport_config(Arc::new(transport_config));
+
+    // 4. Создаем эндпоинт
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_config);
+
     Ok(endpoint)
 }
 
 /// TLS-верификатор, принимающий любые сертификаты.
-/// Используется только в разработке/LAN!
+/// Используется только в разработке / LAN!
 #[derive(Debug)]
 struct SkipServerVerification;
 
 impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        _end_entity:    &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
+        _server_name:   &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
+        _now:           rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct)
-        -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
-    fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &rustls::DigitallySignedStruct)
-        -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -232,10 +254,4 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
             .signature_verification_algorithms
             .supported_schemes()
     }
-}
-fn generate_self_signed_cert() -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>), Box<dyn Error>> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into());
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    Ok((cert_der, key))
 }

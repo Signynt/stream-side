@@ -7,45 +7,51 @@ import android.view.Surface
  * JNI-мост к Rust-библиотеке `libstream_receiver.so`.
  *
  * Порядок вызовов:
- *   1. [initBackend]     — после того как Surface создан
- *   2. [startNetworking] — запустить приём видеопотока
- *   3. [shutdownBackend] — при уничтожении Surface (onPause / поворот экрана)
+ *   1. [initBackend]     — после того как Surface создан (surfaceCreated)
+ *   2. [startNetworking] — при нажатии кнопки "Подключить"
+ *   3. [stopNetworking]  — при нажатии кнопки "Отключить"
+ *   4. [shutdownBackend] — при уничтожении Surface (surfaceDestroyed)
+ *
+ * Примечание: [shutdownBackend] внутри вызывает [stopNetworking] автоматически,
+ * поэтому перед ним явный вызов [stopNetworking] не обязателен.
  */
 object NativeLib {
 
     init {
-        // Имя должно совпадать с [lib] name в Cargo.toml: `stream_receiver`
         System.loadLibrary("stream_receiver")
     }
 
     /**
      * Инициализировать аппаратный HEVC-декодер MediaCodec с переданным Surface.
      *
-     * ВАЖНО: Вызывать только после того, как [Surface] полностью создан
-     * (внутри `surfaceCreated` / `SurfaceHolder.Callback`).
-     *
-     * @param surface Android Surface, полученный из SurfaceView или SurfaceTexture.
-     *                Rust немедленно извлечёт ANativeWindow и не будет хранить
-     *                ссылку на Java-объект.
-     * @param width   Ожидаемая ширина потока (должна совпадать с sender-ом).
-     * @param height  Ожидаемая высота потока.
+     * @param surface Android Surface из SurfaceView.
+     * @param width   Ожидаемая ширина видеопотока.
+     * @param height  Ожидаемая высота видеопотока.
      */
     external fun initBackend(surface: Surface, width: Int, height: Int)
 
     /**
-     * Запустить QUIC-клиент для подключения к sender-у на ПК.
-     * Создаёт фоновый поток, не блокирует вызывающий поток.
+     * Запустить QUIC-клиент для подключения к sender'у.
      *
-     * @param host IP-адрес ПК-sender'а (например, "192.168.1.5")
-     * @param port Порт (по умолчанию 4433)
+     * Если вызывается повторно — автоматически останавливает предыдущее соединение.
+     *
+     * @param host IP-адрес sender'а, например "192.168.1.5"
+     * @param port Порт sender'а, по умолчанию 4433
      */
     external fun startNetworking(host: String, port: Int)
 
     /**
+     * Остановить QUIC-клиент и освободить tokio runtime.
+     *
+     * Безопасно вызывать даже если соединение не было установлено.
+     */
+    external fun stopNetworking()
+
+    /**
      * Остановить декодер и освободить ANativeWindow.
      *
-     * ОБЯЗАТЕЛЬНО вызывать из `surfaceDestroyed` ДО возврата из него,
-     * пока платформа ещё не уничтожила Surface. Иначе — UB в NDK-коде.
+     * ОБЯЗАТЕЛЬНО вызывать из surfaceDestroyed ДО возврата из него.
+     * Внутри также вызывает stopNetworking.
      */
     external fun shutdownBackend()
 }

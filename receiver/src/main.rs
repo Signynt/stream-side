@@ -18,6 +18,7 @@
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::{mpsc, Arc, Mutex};
+use std::net::ToSocketAddrs;
 
 use winit::{
     application::ApplicationHandler,
@@ -379,7 +380,17 @@ impl ApplicationHandler for App {
 
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
+    let args: Vec<String> = std::env::args().collect();
+    let input_addr = &args[1];
+    let addr = input_addr
+        .to_socket_addrs()
+        .expect("Failed to resolve domain")
+        .next() // Берем первый найденный IP
+        .ok_or("Could not find any IP for this domain")?;
 
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
     // Канал между сетевым потоком и рендер-потоком.
     // Размер 3: если рендер отстаёт, старые кадры выбрасываются (low-latency!).
     let (tx, rx) = mpsc::sync_channel::<YuvFrame>(3);
@@ -402,7 +413,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
-                let addr: SocketAddr = "0.0.0.0:4433".parse().unwrap();
                 // На десктопе передаём Some(tx) — YUV-кадры идут в рендер-поток
                 run_quic_receiver(backend_clone, addr, Some(tx_clone)).await;
             }));
