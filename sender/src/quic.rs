@@ -1,9 +1,13 @@
-use quinn::{ClientConfig, Endpoint};
+use quinn::{ClientConfig, Endpoint, SendStream};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use std::net::SocketAddr;
 use rustls::DigitallySignedStruct;
 use quinn::crypto::rustls::QuicClientConfig;
+use std::time::SystemTime;
+use common::VideoPacket;
+
+
 // --- Настройка TLS: Пропускаем проверку сертификатов ---
 #[derive(Debug)]
 struct SkipServerVerification;
@@ -48,12 +52,12 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 }
 
 pub struct QuicSender {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl QuicSender {
     pub async fn new(server_addr: SocketAddr) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(3);
 
         // 1. Конфиг клиента для Rustls 0.23+
         // Нужно явно использовать CryptoProvider (ring)
@@ -75,29 +79,49 @@ impl QuicSender {
         let connection = endpoint.connect(server_addr, "localhost").unwrap().await.expect("Failed to connect");
         println!("✅ QUIC: Соединение установлено!");
 
-        // 3. Открываем один длинный однонаправленный поток
-        let mut send_stream = connection.open_uni().await.unwrap();
-
         // 4. Воркер отправки
         tokio::spawn(async move {
+            let mut frame_id = 0u64;
+            
             while let Some(data) = rx.recv().await {
-                let len = (data.len() as u32).to_le_bytes();
-                if let Err(e) = send_stream.write_all(&len).await {
-                    eprintln!("❌ QUIC Write Len Error: {}", e);
-                    break;
-                }
-                if let Err(e) = send_stream.write_all(&data).await {
-                    eprintln!("❌ QUIC Write Data Error: {}", e);
-                    break;
+                frame_id += 1;
+
+                // 1. Упаковываем данные
+                let packet = VideoPacket {
+                    send_time: SystemTime::now(),
+                    frame_id,
+                    payload: data,
+                };
+
+                // 2. Сериализуем через postcard
+                // to_allocvec — самый удобный способ для динамических данных
+                let encoded = postcard::to_allocvec(&packet).expect("Failed to serialize packet");
+
+                if let Ok(mut send_stream) = connection.open_uni().await {
+                    let len = (encoded.len() as u32).to_le_bytes();
+                    let _ = send_stream.write_all(&len).await;
+                    let _ = send_stream.write_all(&encoded).await;
+                    let _ = send_stream.finish(); // Закрываем стрим, отправка завершена
                 }
             }
-            let _ = send_stream.finish(); 
         });
 
         Self { tx }
     }
 
     pub fn send(&self, data: Vec<u8>) {
-        let _ = self.tx.send(data);
+        // КРИТИЧЕСКИ ВАЖНО: используем try_send вместо блокирующего или неограниченного send
+        if let Err(e) = self.tx.try_send(data) {
+            match e {
+                mpsc::error::TrySendError::Full(_) => {
+                    // Очередь забита — сеть не успевает. Просто выбрасываем этот пакет.
+                    // В логах ресивера ты увидишь пропуск ID кадра, но задержка не вырастет.
+                    // eprintln!("⚠️ Network congestion: dropping frame");
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    eprintln!("❌ QUIC channel closed");
+                }
+            }
+        }
     }
 }

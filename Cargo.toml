@@ -1,4 +1,4 @@
 [workspace]
-members = ["receiver", "sender"]
+members = ["receiver", "sender", "common"]
 resolver = "2"
 default-members = ["sender"]

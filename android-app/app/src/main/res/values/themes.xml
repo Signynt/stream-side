@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.StreamReceiver" parent="android:Theme.DeviceDefault.NoActionBar"/>
+</resources>

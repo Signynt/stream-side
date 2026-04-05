@@ -1,3 +1,9 @@
 /target
 output.h265
 output.mp4
+/android-app/app/build
+/android-app/.gradle
+.gitignore
+android-app/local.properties
+android-app/gradle/wrapper/gradle-wrapper.jar
+android-app/app/my-release-key.jks

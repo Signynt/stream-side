@@ -7,7 +7,7 @@ use pipewire::main_loop::MainLoopBox;
 use pw::properties::properties;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::IntoRawFd;
-use streamcapture::encode::{Encoder, process_frame_from_pw_buffer};
+use sender::encode::{Encoder, process_frame_from_pw_buffer};
 use std::net::SocketAddr;
 use std::env;
 

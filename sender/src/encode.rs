@@ -13,10 +13,10 @@ use std::thread;
 use ffmpeg_next::ffi::*;
 use crate::quic::QuicSender;
 
-
 pub struct Encoder {
     tx: SyncSender<Vec<u8>>,
     _worker: thread::JoinHandle<()>,
+    free_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 unsafe fn init_vaapi_ctx(
@@ -58,8 +58,13 @@ unsafe fn init_vaapi_ctx(
 
 impl Encoder {
     pub fn new(width: u32, height: u32, target_addr: SocketAddr) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(2);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (free_tx, free_rx) = mpsc::channel::<Vec<u8>>();
+
+        let buf_size = (width * height * 4) as usize;
+        free_tx.send(vec![0u8; buf_size]).unwrap();
+        free_tx.send(vec![0u8; buf_size]).unwrap();
 
         let worker = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -85,7 +90,16 @@ impl Encoder {
                 (*raw).height = height as i32;
                 (*raw).time_base = AVRational { num: 1, den: 60 };
                 (*raw).pix_fmt = AVPixelFormat::AV_PIX_FMT_VAAPI;
-                (*raw).bit_rate = 8_000_000;
+                
+                // --- НАСТРОЙКИ БИТРЕЙТА ---
+                let br = 25_000_000;
+                (*raw).bit_rate = br;
+                (*raw).rc_max_rate = br;
+                (*raw).rc_buffer_size = br as i32 / 10; // Маленький буфер = быстрая реакция на забитие сети
+                
+                // --- LOW LATENCY FLAGS ---
+                (*raw).refs = 1; // Только один ссылочный кадр
+                (*raw).global_quality = 20;
             }
 
             // 3. ПОКА enc_ctx еще жив и не перемещен, получаем raw указатель и инициализируем VAAPI
@@ -96,11 +110,16 @@ impl Encoder {
 
             // 4. И только ТЕПЕРЬ окончательно превращаем контекст в открытый энкодер
             // После этого вызова enc_ctx "умрет", и у нас останется только объект encoder
+
+            let mut opts = ffmpeg::Dictionary::new();
+            opts.set("async_depth", "1");
+            opts.set("intra_refresh", "1"); // Постепенное обновление кадров
+            opts.set("low_delay_brc", "1");
             let mut encoder = enc_ctx
                 .encoder()
                 .video()
                 .unwrap()
-                .open()
+                .open_with(opts)
                 .unwrap();
             unsafe {
                 (*encoder.as_mut_ptr()).gop_size = 60; // keyframe каждые 60 кадров
@@ -109,7 +128,7 @@ impl Encoder {
             let mut scaler = scaling::Context::get(
                 Pixel::BGRA, width, height,
                 Pixel::NV12, width, height,
-                scaling::Flags::BILINEAR,
+                scaling::Flags::FAST_BILINEAR,
             ).unwrap();
 
             ready_tx.send(()).unwrap();
@@ -120,57 +139,70 @@ impl Encoder {
             let mut next_tick = std::time::Instant::now();
 
             // Последний известный кадр для повтора
-            let mut last_bgra: Option<Vec<u8>> = None;
 
             loop {
-                // Читаем новый кадр если есть
-                loop {
-                    match rx.try_recv() {
-                        Ok(frame) => { last_bgra = Some(frame); }
-                        Err(_) => break,
+                let mut received_any = false;
+                let mut last_bgra: Option<Vec<u8>> = None;
+
+                while let Ok(frame) = rx.try_recv() {
+                    if let Some(old) = last_bgra.take() {
+                        let _ = free_tx.send(old);
                     }
+                    last_bgra = Some(frame);
+                    received_any = true;
                 }
 
-                if let Some(ref bgra) = last_bgra {
-                    let mut src = Video::new(Pixel::BGRA, width, height);
-                    src.data_mut(0)[..bgra.len()].copy_from_slice(bgra);
+                if let Some(bgra) = last_bgra {
+                    if received_any {
+                        let mut src = Video::new(Pixel::BGRA, width, height);
+                        src.data_mut(0)[..bgra.len()].copy_from_slice(&bgra);
 
-                    let mut nv12 = Video::new(Pixel::NV12, width, height);
-                    scaler.run(&src, &mut nv12).unwrap();
-                    nv12.set_pts(Some(frame_idx));
-                    frame_idx += 1;
+                        let mut nv12 = Video::new(Pixel::NV12, width, height);
+                        scaler.run(&src, &mut nv12).unwrap();
+                        nv12.set_pts(Some(frame_idx));
+                        frame_idx += 1;
 
-                    let mut hw_frame = Video::new(Pixel::VAAPI, width, height);
-                    unsafe {
-                        av_hwframe_get_buffer(hw_frames_ref, hw_frame.as_mut_ptr(), 0);
-                        av_hwframe_transfer_data(hw_frame.as_mut_ptr(), nv12.as_ptr(), 0);
-                        (*hw_frame.as_mut_ptr()).pts = frame_idx - 1;
+                        let mut hw_frame = Video::new(Pixel::VAAPI, width, height);
+                        unsafe {
+                            av_hwframe_get_buffer(hw_frames_ref, hw_frame.as_mut_ptr(), 0);
+                            av_hwframe_transfer_data(hw_frame.as_mut_ptr(), nv12.as_ptr(), 0);
+                            (*hw_frame.as_mut_ptr()).pts = frame_idx - 1;
+                        }
+
+                        encoder.send_frame(&hw_frame).unwrap();
+
+                        let mut pkt = ffmpeg::Packet::empty();
+                        while encoder.receive_packet(&mut pkt).is_ok() {
+                            // --- ОТПРАВКА В QUIC ---
+                            let data = pkt.data().unwrap().to_vec();
+                            quic_sender.send(data);
+                        }
                     }
-
-                    encoder.send_frame(&hw_frame).unwrap();
-
-                    let mut pkt = ffmpeg::Packet::empty();
-                    while encoder.receive_packet(&mut pkt).is_ok() {
-                        // --- ОТПРАВКА В QUIC ---
-                        let data = pkt.data().unwrap().to_vec();
-                        quic_sender.send(data);
-                    }
+                    let _ = free_tx.send(bgra);
                 }
 
                 next_tick += frame_duration;
                 let now = std::time::Instant::now();
                 if next_tick > now {
                     std::thread::sleep(next_tick - now);
+                } else {
+                    // Если не успеваем — сдвигаем таймер вперед, чтобы не накапливать задержку
+                    next_tick = now;
                 }
             }
         });
 
         ready_rx.recv().unwrap();
-        Self { tx, _worker: worker }
+        Self { tx, _worker: worker, free_rx }
     }
 
     pub fn encode(&self, frame: &[u8]) {
-        let _ = self.tx.try_send(frame.to_vec());
+        // Забираем свободный буфер из пула. Если энкодер тупит и пул пуст — пропускаем захват кадра
+        if let Ok(mut buf) = self.free_rx.try_recv() {
+            let len = frame.len().min(buf.len());
+            buf[..len].copy_from_slice(&frame[..len]); // Быстрое копирование в готовую память
+            let _ = self.tx.try_send(buf);
+        }
     }
 }
 
