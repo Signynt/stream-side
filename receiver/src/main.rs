@@ -41,7 +41,7 @@ struct WgpuState {
     config:             wgpu::SurfaceConfiguration,
     render_pipeline:    wgpu::RenderPipeline,
     bind_group_layout:  wgpu::BindGroupLayout,
-    textures:           Option<(wgpu::Texture, wgpu::Texture, wgpu::Texture, wgpu::BindGroup)>,
+    textures:           Option<(wgpu::Texture, wgpu::Texture, wgpu::BindGroup)>,
 }
 
 impl WgpuState {
@@ -84,54 +84,40 @@ impl WgpuState {
 
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label:   Some("YUV Bind Group Layout"),
+                label:   Some("NV12 Bind Group Layout"),
                 entries: &[
+                    // Y Plane
                     wgpu::BindGroupLayoutEntry {
-                        binding:    0,
+                        binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled:   false,
+                            multisampled: false,
                         },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding:    1,
+                        binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty:    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    // UV Plane (Interleaved)
                     wgpu::BindGroupLayoutEntry {
-                        binding:    2,
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
-                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled:   false,
+                            multisampled: false,
                         },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding:    3,
+                        binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty:    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding:    4,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type:    wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled:   false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding:    5,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty:    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
                 ],
@@ -196,79 +182,93 @@ impl WgpuState {
 
     fn update_textures(&mut self, frame: &YuvFrame) {
         let needs_recreate = match &self.textures {
-            None          => true,
-            Some((ty, _, _, _)) => {
-                ty.size().width != frame.width || ty.size().height != frame.height
+            None => true,
+            Some((t_y, _, _)) => {
+                t_y.size().width != frame.width || t_y.size().height != frame.height
             }
         };
 
         if needs_recreate {
-            log::info!("Creating textures {}x{}", frame.width, frame.height);
+            log::info!("Creating NV12 textures {}x{}", frame.width, frame.height);
 
-            let create_tex = |label, w, h| {
-                self.device.create_texture(&wgpu::TextureDescriptor {
-                    label:             Some(label),
-                    size:              wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count:   1,
-                    sample_count:      1,
-                    dimension:         wgpu::TextureDimension::D2,
-                    format:            wgpu::TextureFormat::R8Unorm,
-                    usage:             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats:      &[],
-                })
-            };
+            // Текстура Y (R8Unorm)
+            let t_y = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Y Texture"),
+                size: wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
 
-            let t_y = create_tex("Y", frame.width, frame.height);
-            let t_u = create_tex("U", frame.width / 2, frame.height / 2);
-            let t_v = create_tex("V", frame.width / 2, frame.height / 2);
+            // Текстура UV (Rg8Unorm) - ширина и высота в 2 раза меньше
+            let t_uv = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("UV Texture"),
+                size: wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg8Unorm, // Двухканальный формат
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
 
             let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                address_mode_w: wgpu::AddressMode::ClampToEdge,
-                mag_filter:     wgpu::FilterMode::Linear,
-                min_filter:     wgpu::FilterMode::Linear,
-                mipmap_filter:  wgpu::MipmapFilterMode::Nearest,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             });
 
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 layout: &self.bind_group_layout,
-                label:  Some("YUV Bind Group"),
+                label:  Some("NV12 Bind Group"),
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&t_y.create_view(&Default::default())) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&t_u.create_view(&Default::default())) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&t_uv.create_view(&Default::default())) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&t_v.create_view(&Default::default())) },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&sampler) },
                 ],
             });
 
-            self.textures = Some((t_y, t_u, t_v, bind_group));
+            self.textures = Some((t_y, t_uv, bind_group));
         }
 
-        if let Some((t_y, t_u, t_v, _)) = &self.textures {
-            let write = |tex: &wgpu::Texture, data: &[u8], w, h, stride| {
-                self.queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture:    tex,
-                        mip_level:  0,
-                        origin:     wgpu::Origin3d::ZERO,
-                        aspect:     wgpu::TextureAspect::All,
-                    },
-                    data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset:          0,
-                        bytes_per_row:   Some(stride),
-                        rows_per_image:  Some(h),
-                    },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                )
-            };
-            write(t_y, &frame.y, frame.width,     frame.height,     frame.y_stride);
-            write(t_u, &frame.u, frame.width / 2, frame.height / 2, frame.u_stride);
-            write(t_v, &frame.v, frame.width / 2, frame.height / 2, frame.v_stride);
+        if let Some((t_y, t_uv, _)) = &self.textures {
+            // Загружаем Y плоскость
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture:   t_y,
+                    mip_level: 0,
+                    origin:    wgpu::Origin3d::ZERO,
+                    aspect:    wgpu::TextureAspect::All,
+                },
+                &frame.y,
+                wgpu::TexelCopyBufferLayout {
+                    offset:         0,
+                    bytes_per_row:  Some(frame.y_stride),
+                    rows_per_image: Some(frame.height),
+                },
+                t_y.size(),
+            );
+
+            // Загружаем UV плоскость (используем frame.uv из нашего прошлого обсуждения)
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture:   t_uv,
+                    mip_level: 0,
+                    origin:    wgpu::Origin3d::ZERO,
+                    aspect:    wgpu::TextureAspect::All,
+                },
+                &frame.uv,
+                wgpu::TexelCopyBufferLayout {
+                    offset:         0,
+                    bytes_per_row:  Some(frame.uv_stride),
+                    rows_per_image: Some(frame.height / 2),
+                },
+                t_uv.size(),
+            );
         }
     }
 
@@ -307,7 +307,7 @@ impl WgpuState {
                 multiview_mask:            None,
             });
 
-            if let Some((_, _, _, bind_group)) = &self.textures {
+            if let Some((_, _, bind_group)) = &self.textures {
                 pass.set_pipeline(&self.render_pipeline);
                 pass.set_bind_group(0, bind_group, &[]);
                 pass.draw(0..3, 0..1);
@@ -324,10 +324,20 @@ impl WgpuState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct App {
-    state:           Option<WgpuState>,
-    window:          Option<Arc<Window>>,
-    frame_rx:        mpsc::Receiver<YuvFrame>,
+    state: Option<WgpuState>,
+    window: Option<Arc<Window>>,
+    frame_rx: mpsc::Receiver<YuvFrame>,
     frames_rendered: u64,
+}
+
+impl App {
+    fn poll_latest_frame(&mut self) -> Option<YuvFrame> {
+        let mut latest = None;
+        while let Ok(frame) = self.frame_rx.try_recv() {
+            latest = Some(frame);
+        }
+        latest
+    }
 }
 
 impl ApplicationHandler for App {
@@ -336,42 +346,69 @@ impl ApplicationHandler for App {
             let attrs = Window::default_attributes()
                 .with_title("StreamCapture Receiver")
                 .with_inner_size(winit::dpi::LogicalSize::new(1280.0f64, 720.0f64));
+
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
-            self.window = Some(window.clone());
-            self.state  = Some(pollster::block_on(WgpuState::new(window)));
+            self.state = Some(pollster::block_on(WgpuState::new(window.clone())));
+            self.window = Some(window);
+
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let state = match self.state.as_mut() { Some(s) => s, None => return };
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(frame) = self.poll_latest_frame() {
+        
+            if let Some(state) = self.state.as_mut() {
+                state.update_textures(&frame);
 
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size)  => {
-                state.config.width  = size.width.max(1);
-                state.config.height = size.height.max(1);
-                state.surface.configure(&state.device, &state.config);
-                if let Some(w) = &self.window { w.request_redraw(); }
-            }
-            WindowEvent::RedrawRequested => {
-                // Берём только последний кадр (пропускаем накопившиеся)
-                let mut latest = None;
-                while let Ok(f) = self.frame_rx.try_recv() { latest = Some(f); }
+                let mut trace = frame.trace;
+                trace.present_us = FrameTrace::now_us();
 
-                if let Some(frame) = latest {
-                
-                    state.update_textures(&frame);
-                    let mut trace = frame.trace;
-                    trace.present_us = FrameTrace::now_us();
-
-                    if frame.frame_id % 120 == 0 {
-                        log_trace(frame.frame_id, &trace);
-                    }
+                self.frames_rendered += 1;
+                if frame.frame_id % 120 == 0 {
+                    log_trace(frame.frame_id, &trace);
                 }
 
-                state.render();
-                if let Some(w) = &self.window { w.request_redraw(); }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
+        let state = match self.state.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        match event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+            }
+
+            WindowEvent::Resized(size) => {
+                state.config.width = size.width.max(1);
+                state.config.height = size.height.max(1);
+                state.surface.configure(&state.device, &state.config);
+
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+
+            WindowEvent::RedrawRequested => {
+                state.render();
+            }
+
             _ => {}
         }
     }
@@ -436,7 +473,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn log_trace(frame_id: u64, t: &FrameTrace) {
     log::info!(
-        "#{frame_id}: From capture to encoded={:.1}ms, From encoded to serialized={:.1}ms,
+        "\n#{frame_id}: From capture to encoded={:.1}ms, From encoded to serialized={:.1}ms,
         From serialized to received by the client={:.1}ms, From received to assembled={:.1}ms, 
         From assembled to decoded={:.1}ms, From decoded to presented={:.1}ms
         TOTAL LATENCY={:.1}ms",

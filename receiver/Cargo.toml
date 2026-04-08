@@ -56,3 +56,11 @@ jni = { version = "0.22.4", features = ["invocation"] }
 ndk-sys = "0.6"
 # Логирование в logcat
 android_logger = "0.14"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+sender = { path = "../sender" }
+
+[[bench]]
+name = "decode_profile"
+harness = false

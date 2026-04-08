@@ -1,28 +1,46 @@
 //! Linux screen-capture sender: XDG Desktop Portal + PipeWire + VAAPI HEVC.
 //!
-//! # Architecture
+//! # Архитектура
 //!
 //! ```text
 //!   XDG Portal (ashpd)
 //!       │  open_pipe_wire_remote()
 //!       ▼
-//!   PipeWire stream (SpA BGRA frames, ~60 fps)
-//!       │  process callback (sync OS thread)
+//!   PipeWire stream (SpA BGRA кадры, ~60 fps)
+//!       │  process callback (синхронный OS-поток)
+//!       │
+//!       ├─ SPA_DATA_DmaBuf ──► dup(fd) ──► queue_raw_buffer() ──► Encoder::encode_dmabuf()
+//!       │                                                              │
+//!       │                                    DRM_PRIME(BGRA) frame ◄──┘
+//!       │                                    av_hwframe_transfer_data (GPU/VPP)
+//!       │                                    VAAPI(NV12) ──► hevc_vaapi
+//!       │
+//!       └─ SPA_DATA_MemPtr/MemFd ──► mmap/ptr ──► Encoder::encode_bgra()
+//!                                                     │
+//!                                   copy_from_slice ◄─┘
+//!                                   SwsScale (CPU BGRA→NV12)
+//!                                   av_hwframe_transfer_data
+//!                                   hevc_vaapi
 //!       ▼
-//!   Encoder::encode(&[u8])          ← double-buffered, drop-if-full
-//!       │  SyncSender<Vec<u8>>
-//!       ▼
-//!   Encoder worker thread
-//!       │  VAAPI: BGRA→NV12→HW→hevc_vaapi
-//!       │  mpsc::Sender<(Vec<u8>, bool)>
-//!       ▼
-//!   QuicServer serialiser task      ← downstream of VideoSender::run()
+//!   mpsc::Sender<EncodedFrame>  →  QuicServer serialiser task
 //! ```
 //!
-//! The PipeWire mainloop runs on a dedicated OS thread because `mainloop.run()`
-//! is a blocking C call that cannot be `await`-ed.  A `oneshot` channel bridges
-//! it back to the async world so that fatal errors propagate correctly.
-
+//! ## DMA-BUF zero-copy
+//!
+//! При `SPA_DATA_DmaBuf` PipeWire передаёт DMA-BUF fd. Мы:
+//! 1. Делаем `dup(fd)` — независимый дескриптор, держащий DMA-BUF живым.
+//! 2. Немедленно возвращаем PipeWire-буфер (`queue_raw_buffer`).
+//! 3. Передаём dup-нутый fd в энкодер; тот делает GPU-копию
+//!    (`av_hwframe_transfer_data`: DRM_PRIME → VAAPI) и закрывает fd.
+//!
+//! CPU не касается пиксельных данных.
+//!
+//! ## Потоки
+//!
+//! PipeWire mainloop исполняется на выделенном OS-потоке, т.к.
+//! `mainloop.run()` — блокирующий C-вызов. `oneshot`-канал пробрасывает
+//! фатальные ошибки обратно в async-мир.
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     os::{fd::FromRawFd, unix::io::IntoRawFd},
     sync::Arc,
@@ -33,12 +51,16 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
     PersistMode,
 };
+use libc::c_int;
+use pipewire::spa::pod::Value;
+use pipewire::spa::utils::Id;
 use pipewire as pw;
 use pipewire::{
     context::ContextBox,
     main_loop::MainLoopBox,
     spa::pod::PropertyFlags,
 };
+use pipewire::spa::sys as spa_sys;
 use pw::properties::properties;
 use tokio::sync::{mpsc, oneshot};
 
@@ -48,22 +70,17 @@ use super::SenderError;
 use super::super::encode::Encoder;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public type
+// Публичный тип
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Linux screen-capture sender backed by XDG Portal, PipeWire, and VAAPI HEVC.
-///
-/// Construct with [`LinuxPipeWireSender::new`], then pass to [`crate::capture::VideoSender::run`].
+/// Linux screen-capture sender: XDG Portal + PipeWire + VAAPI HEVC.
 pub struct LinuxPipeWireSender {
     width:  u32,
     height: u32,
 }
 
 impl LinuxPipeWireSender {
-    /// Create a new sender that will capture and encode at `width × height`.
-    ///
-    /// Resolution should match the actual monitor / window dimensions; a
-    /// mismatch causes the BGRA→NV12 scaler to stretch or crop silently.
+    /// Создать sender для захвата и кодирования в разрешении `width × height`.
     pub fn new(width: u32, height: u32) -> Self {
         Self { width, height }
     }
@@ -80,19 +97,13 @@ impl super::VideoSender for LinuxPipeWireSender {
         self,
         sink: mpsc::Sender<EncodedFrame>,
     ) -> Result<(), SenderError> {
-        // 1. Negotiate the XDG Portal screencast session.
         let (node_id, raw_fd) = run_portal()
             .await
             .map_err(|e| SenderError::CaptureInit(e.to_string()))?;
 
-        // 2. The PipeWire mainloop is blocking — run it on a dedicated OS thread.
-        //    A oneshot channel carries any fatal error back to the async world.
         let (err_tx, err_rx) = oneshot::channel::<SenderError>();
         let width  = self.width;
         let height = self.height;
-
-        // Propagate the current Tokio runtime handle so the Encoder worker thread
-        // (inside Encoder::new) can use tokio primitives without a new runtime.
         let rt_handle = tokio::runtime::Handle::current();
 
         std::thread::Builder::new()
@@ -105,12 +116,8 @@ impl super::VideoSender for LinuxPipeWireSender {
             })
             .map_err(|e| SenderError::CaptureInit(format!("thread spawn: {e}")))?;
 
-        // 3. Wait for the PipeWire thread to signal a fatal error.
-        //    If the future is dropped (Ctrl-C), the thread is left to die on its
-        //    own when the process exits — PipeWire has no remote-stop API.
         match err_rx.await {
-            Ok(e) => Err(e),
-            // Sender dropped without sending ⟹ thread finished cleanly.
+            Ok(e)  => Err(e),
             Err(_) => Ok(()),
         }
     }
@@ -166,6 +173,9 @@ fn run_pipewire(
         )
         .map_err(|e| SenderError::CaptureInit(format!("pw connect_fd: {e}")))?;
 
+    let current_modifier = Arc::new(AtomicU64::new(0)); 
+    let modifier_for_param = current_modifier.clone();
+
     let stream = pw::stream::StreamBox::new(&core, "capture", properties! {
         *pw::keys::MEDIA_TYPE     => "Video",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -173,45 +183,135 @@ fn run_pipewire(
     })
     .map_err(|e| SenderError::CaptureInit(format!("pw stream: {e}")))?;
 
-    // Create the encoder once; it spawns its own worker thread internally.
     let mut encoder: Option<Encoder> = None;
     let mut fps_counter = 0u32;
     let mut fps_tick    = std::time::Instant::now();
 
     use common::FrameTrace;
+
     let _listener = stream
         .add_local_listener::<()>()
+        .param_changed(move |_stream, _data, id, param| {
+        if id != pw::spa::sys::SPA_PARAM_EnumFormat && id != pw::spa::sys::SPA_PARAM_Format {
+            return;
+        }
+
+        let param = match param {
+            Some(p) => p,
+            None => return,
+        };
+
+        // 🔥 Главное исправление
+        let obj = match param.as_object() {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        if let Some(prop) = obj.find_prop(Id(pw::spa::sys::SPA_FORMAT_VIDEO_modifier)) {
+            let val = prop.value();
+
+            if val.is_long() {
+                if let Ok(m) = val.get_long() {
+                    log::info!("[PipeWire] modifier: {:#x}", m);
+                    modifier_for_param.store(m as u64, Ordering::SeqCst);
+                }
+            }
+        }
+    })
         .process(move |stream, _| {
             let raw = unsafe { stream.dequeue_raw_buffer() };
             if raw.is_null() { return; }
+
             let capture_us = FrameTrace::now_us();
+
             unsafe {
-                crate::encode::process_frame_from_pw_buffer(raw, |src| {
-                    let enc = encoder.get_or_insert_with(|| {
-                        Encoder::new(width, height, sink.clone())
-                    });
-                    enc.encode(src, capture_us);
-                    fps_counter += 1;
+                // Валидируем буфер.
+                if (*raw).buffer.is_null() {
+                    stream.queue_raw_buffer(raw);
+                    return;
+                }
+                let spa_buf = &*(*raw).buffer;
+                if spa_buf.n_datas == 0 || spa_buf.datas.is_null() {
+                    stream.queue_raw_buffer(raw);
+                    return;
+                }
+
+                let data  = &*spa_buf.datas;
+                let chunk = match data.chunk.as_ref() {
+                    Some(c) => c,
+                    None    => { stream.queue_raw_buffer(raw); return; }
+                };
+
+                let size   = chunk.size   as usize;
+                let offset = chunk.offset;
+                let stride = chunk.stride as u32;
+
+                if size == 0 {
+                    stream.queue_raw_buffer(raw);
+                    return;
+                }
+
+                let enc = encoder.get_or_insert_with(|| {
+                    Encoder::new(width, height, sink.clone())
                 });
 
+                match data.type_ {
+                    // ── Zero-copy DMA-BUF путь ────────────────────────────────
+                    //
+                    // 1. dup(fd)           — наша независимая ссылка на DMA-BUF.
+                    // 2. queue_raw_buffer  — возвращаем PW-буфер немедленно.
+                    // 3. encode_dmabuf     — GPU-импорт без участия CPU.
+                    spa_sys::SPA_DATA_DmaBuf => {
+                        let duped = libc::dup(data.fd as c_int);
+                        let modifier = current_modifier.load(Ordering::Relaxed);
+                        // Возвращаем PipeWire-буфер до отправки fd энкодеру.
+                        stream.queue_raw_buffer(raw);
+
+                        if duped < 0 {
+                            log::warn!("[PipeWire] dup() failed for DmaBuf fd");
+                        } else {
+                            enc.encode_dmabuf(duped, stride, offset, modifier, capture_us);
+                        }
+                    }
+
+                    // ── CPU fallback: MemPtr / MemFd ──────────────────────────
+                    spa_sys::SPA_DATA_MemPtr | spa_sys::SPA_DATA_MemFd => {
+                        crate::encode::process_frame_from_pw_buffer(raw, |src| {
+                            enc.encode_bgra(src, capture_us);
+                        });
+                        stream.queue_raw_buffer(raw);
+                    }
+
+                    other => {
+                        log::debug!("[PipeWire] Неизвестный тип SPA_DATA: {other}, пропускаем");
+                        stream.queue_raw_buffer(raw);
+                        return; // не считаем в fps
+                    }
+                }
+
+                fps_counter += 1;
                 if fps_tick.elapsed() >= Duration::from_secs(1) {
                     log::debug!("[PipeWire] FPS: {fps_counter}");
                     fps_counter = 0;
                     fps_tick    = std::time::Instant::now();
                 }
-
-                stream.queue_raw_buffer(raw);
             }
         })
         .register()
         .map_err(|e| SenderError::CaptureInit(format!("pw listener: {e}")))?;
 
-    let spa_params = build_spa_video_params();
-    let mut params = [pw::spa::pod::Pod::from_bytes(&spa_params)
-        .ok_or_else(|| SenderError::CaptureInit("invalid SPA params".into()))?];
+    // SPA params: запрашиваем BGRA + разрешаем DmaBuf.
+    let spa_format = build_spa_video_params();
+    let spa_buffers = build_spa_buffer_params();
+    
+    let mut params = [
+        pw::spa::pod::Pod::from_bytes(&spa_format)
+            .ok_or_else(|| SenderError::CaptureInit("invalid SPA format".into()))?,
+        pw::spa::pod::Pod::from_bytes(&spa_buffers)
+            .ok_or_else(|| SenderError::CaptureInit("invalid SPA buffers".into()))?,
+    ];
 
-    stream
-        .connect(
+    stream.connect(
             pw::spa::utils::Direction::Input,
             Some(node_id),
             pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
@@ -228,6 +328,11 @@ fn run_pipewire(
 // SPA video format pod
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Строит SPA EnumFormat pod: Video/raw/BGRA.
+///
+/// PipeWire будет предпочитать DmaBuf если compositor его поддерживает
+/// (Wayland compositor с linux-dmabuf-unstable-v1), и автоматически
+/// падать back на MemFd/MemPtr если нет.
 fn build_spa_video_params() -> Vec<u8> {
     use pw::spa::pod::serialize::PodSerializer;
     use pw::spa::sys::*;
@@ -250,6 +355,37 @@ fn build_spa_video_params() -> Vec<u8> {
                 key:   SPA_FORMAT_VIDEO_format,
                 flags: PropertyFlags::empty(),
                 value: pw::spa::pod::Value::Id(pw::spa::utils::Id(SPA_VIDEO_FORMAT_BGRA)),
+            },
+            // МАГИЯ ЗДЕСЬ: Сообщаем Hyprland/PipeWire, что мы умеем читать видеопамять (DMA-BUF)
+            // Мы запрашиваем линейный формат памяти (0 = DRM_FORMAT_MOD_LINEAR),
+            // который нужен нашему энкодеру в encode.rs
+            pw::spa::pod::Property {
+                key:   SPA_FORMAT_VIDEO_modifier,
+                flags: PropertyFlags::MANDATORY,
+                value: pw::spa::pod::Value::Long(0), 
+            },
+        ],
+    });
+
+    let mut bytes = Vec::new();
+    PodSerializer::serialize(&mut std::io::Cursor::new(&mut bytes), &value).unwrap();
+    bytes
+}
+
+// НОВАЯ ФУНКЦИЯ: Жестко требуем от PipeWire присылать именно DMA-BUF
+fn build_spa_buffer_params() -> Vec<u8> {
+    use pw::spa::pod::serialize::PodSerializer;
+    use pw::spa::sys::*;
+
+    let value = pw::spa::pod::Value::Object(pw::spa::pod::Object {
+        type_: SPA_TYPE_OBJECT_ParamBuffers,
+        id:    SPA_PARAM_Buffers,
+        properties: vec![
+            pw::spa::pod::Property {
+                key:   SPA_PARAM_BUFFERS_dataType,
+                flags: PropertyFlags::empty(),
+                // Устанавливаем битовую маску, разрешающую ТОЛЬКО DmaBuf
+                value: pw::spa::pod::Value::Int(1 << (SPA_DATA_DmaBuf as i32)),
             },
         ],
     });

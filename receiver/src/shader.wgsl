@@ -22,29 +22,39 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
     return out;
 }
 
-// YUV planes
+// NV12 planes
 @group(0) @binding(0) var t_y: texture_2d<f32>;
 @group(0) @binding(1) var s_y: sampler;
 
-@group(0) @binding(2) var t_u: texture_2d<f32>;
-@group(0) @binding(3) var s_u: sampler;
+// Вторая текстура содержит сразу U и V
+@group(0) @binding(2) var t_uv: texture_2d<f32>;
+@group(0) @binding(3) var s_uv: sampler;
 
-@group(0) @binding(4) var t_v: texture_2d<f32>;
-@group(0) @binding(5) var s_v: sampler;
+// Убираем старые биндинги 4 и 5 (t_v, s_v), они больше не нужны
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // 1. Читаем яркость (Y)
     let y = textureSample(t_y, s_y, in.tex_coords).r;
-    let u = textureSample(t_u, s_u, in.tex_coords).r - 0.5;
-    let v = textureSample(t_v, s_v, in.tex_coords).r - 0.5;
+    
+    // 2. Читаем хроматическую составляющую (UV)
+    // В формате NV12: Red канал текстуры — это U, Green — это V
+    let uv = textureSample(t_uv, s_uv, in.tex_coords).rg;
+    
+    // Центрируем цветовые компоненты (они в диапазоне [0, 1], переводим в [-0.5, 0.5])
+    let u = uv.r - 0.5;
+    let v = uv.g - 0.5;
 
-    // Коэффициенты BT.709
+    // 3. Конвертация YUV -> RGB (BT.709 коэффициенты)
     let r = y + 1.5748 * v;
     let g = y - 0.1873 * u - 0.4681 * v;
     let b = y + 1.8556 * u;
 
     let rgb = vec3<f32>(r, g, b);
+
+    // 4. Гамма-коррекция и финальный вывод
+    // max(..., 0.0) нужен, чтобы pow не выдал ошибку на отрицательных значениях (бывают после YUV магии)
+    let corrected_rgb = pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
     
-    // ПРИМЕНЯЕМ ГАММУ 2.2 (делает цвета сочнее и темнее)
-    return vec4<f32>(pow(max(rgb, vec3<f32>(0.0)), vec3<f32>(2.2)), 1.0);
+    return vec4<f32>(corrected_rgb, 1.0);
 }

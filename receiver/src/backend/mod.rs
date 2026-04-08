@@ -56,16 +56,12 @@ impl std::error::Error for BackendError {}
 pub struct YuvFrame {
     pub frame_id: u64,
     pub trace:    FrameTrace,
-
     pub width:    u32,
     pub height:   u32,
-    // Три раздельных плоскости — именно этого ждёт наш WGSL-шейдер
     pub y:        Vec<u8>,
-    pub u:        Vec<u8>,
-    pub v:        Vec<u8>,
+    pub uv:       Vec<u8>,
     pub y_stride: u32,
-    pub u_stride: u32,
-    pub v_stride: u32,
+    pub uv_stride: u32,
 }
 
 // ─────────────────────────────────────────
