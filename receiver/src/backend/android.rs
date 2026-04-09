@@ -7,6 +7,7 @@ unsafe extern "C" {}
 #[link(name = "android")]
 unsafe extern "C" {}
 
+use tokio::sync::watch;
 use std::ffi::CString;
 use std::ptr;
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,7 @@ use common::FrameTrace;
 static BACKEND: OnceCell<Arc<Mutex<AndroidMediaCodecBackend>>> = OnceCell::new();
 static NETWORK_RT: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
 static LATEST_LATENCY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static TRACE_TX: OnceCell<watch::Sender<Option<(u64, FrameTrace)>>> = OnceCell::new();
 
 fn get_or_create_backend() -> Arc<Mutex<AndroidMediaCodecBackend>> {
     BACKEND
@@ -64,7 +66,8 @@ impl Drop for CodecState {
 pub struct AndroidMediaCodecBackend {
     state:        Option<CodecState>,
     frame_pts_us: u64,
-    traces:       VecDeque<FrameTrace>,
+    traces:       VecDeque<(u64, FrameTrace)>,
+    last_rendered: Option<(u64, FrameTrace)>,
 }
 
 impl AndroidMediaCodecBackend {
@@ -74,37 +77,26 @@ impl AndroidMediaCodecBackend {
             state:        None,
             frame_pts_us: 0,
             traces:       VecDeque::new(),
+            last_rendered: None,
         }
     }
 
     pub fn on_vsync(&mut self, _frame_time_ns: u64) {
-        if let Some(trace) = self.traces.pop_front() {
-            let offset = crate::network::CLOCK_OFFSET.load(Ordering::Relaxed);
-            
-            // В локальное время телефона (i64, так как offset может быть отрицательным)
-            let local_capture_us = (trace.capture_us as i64).saturating_sub(offset);
-            let present_us = FrameTrace::now_us();
-            
-            let diff_us = present_us.saturating_sub(local_capture_us as u64);
+        let Some((frame_id, mut trace)) = self.last_rendered.take() else { return };
 
-            // Статический счетчик для логов, чтобы не захламлять консоль
-            static mut LOG_THROTTLE: u64 = 0;
-            unsafe {
-                LOG_THROTTLE += 1;
-                if LOG_THROTTLE % 60 == 0 {
-                    log::info!(
-                        "[LatencyDebug] Present: {} | LocalCap: {} | Offset: {} | Diff: {}us",
-                        present_us, local_capture_us, offset, diff_us
-                    );
-                }
-            }
+        let offset = common::CLOCK_OFFSET.load(Ordering::Relaxed);
+        let local_capture_us = (trace.capture_us as i64).saturating_sub(offset);
+        let present_us = FrameTrace::now_us();
 
-            let total_ms = diff_us as f64 / 1000.0;
+        let diff_us = present_us as i64 - local_capture_us;
+        if diff_us <= 0 { return; }
 
-            if let Ok(mut lat) = LATEST_LATENCY.lock() {
-                // Если видишь 0.0, значит diff_us после saturating_sub стал нулем
-                *lat = format!("{:.1} ms", total_ms);
-            }
+        trace.present_us = present_us;
+        if let Some(tx) = TRACE_TX.get() {
+            let _ = tx.send(Some((frame_id, trace)));
+        }
+        if let Ok(mut lat) = LATEST_LATENCY.lock() {
+            *lat = format!("{:.1} ms", diff_us as f64 / 1000.0);
         }
     }
 
@@ -189,6 +181,11 @@ impl VideoBackend for AndroidMediaCodecBackend {
     fn push_encoded(&mut self, payload: &[u8], frame_id: u64, trace: Option<FrameTrace>) -> Result<(), BackendError> {
         let state = self.state.as_ref().ok_or(BackendError::NotInitialized)?;
 
+        let mut trace = trace;
+        if let Some(t) = trace.as_mut() {
+            t.reassembled_us = FrameTrace::now_us();
+        }
+
         unsafe {
             let idx = ndk_sys::AMediaCodec_dequeueInputBuffer(state.codec, 2_000);
             if idx < 0 { return Ok(()); } 
@@ -199,10 +196,11 @@ impl VideoBackend for AndroidMediaCodecBackend {
             ptr::copy_nonoverlapping(payload.as_ptr(), buf_ptr, copy_len);
 
             // КЛАДЕМ трейс в очередь ПЕРЕД очередью декодера
-            if let Some(t) = trace {
+            if let Some(mut t) = trace {
                 // Если очередь слишком разрослась (например, кадры не выходят), чистим старое
+                t.decode_us = FrameTrace::now_us();
                 if self.traces.len() > 64 { self.traces.pop_front(); }
-                self.traces.push_back(t);
+                self.traces.push_back((frame_id, t));
             }
 
             self.frame_pts_us = frame_id.saturating_mul(16_667);
@@ -222,11 +220,37 @@ impl VideoBackend for AndroidMediaCodecBackend {
             if idx >= 0 {
                 // КРИТИЧЕСКИЙ МОМЕНТ: Выводим кадр на экран. 
                 // true означает "отрендерить на Surface немедленно"
-                ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);
+                let pts = info.presentationTimeUs as u64;
+
+                let found = self.traces
+                    .iter()
+                    .find(|(id, _)| id.saturating_mul(16_667) == pts)
+                    .map(|(id, t)| (*id, *t));
+
+                let should_drop = self.traces
+                    .iter()
+                    .find(|(id, _)| id.saturating_mul(16_667) == pts)
+                    .map(|(_, trace)| {
+                        let now_us = FrameTrace::now_us() as i64;
+                        let latency_ms = (now_us - trace.decode_us as i64) as f64 / 1000.0;
+                        latency_ms > 33.0
+                    })
+                    .unwrap_or(false);
                 
-                // Мы НЕ удаляем из очереди traces здесь! 
-                // Мы удалим его в on_vsync, когда сработает событие обновления экрана.
-                Ok(FrameOutput::DirectToSurface)
+
+                while self.traces.front()
+                    .map_or(false, |(id, _)| id.saturating_mul(16_667) <= pts)
+                {
+                    self.traces.pop_front();
+                }
+                if should_drop {
+                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
+                    Ok(FrameOutput::Pending)
+                } else {
+                    self.last_rendered = found;
+                    ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);
+                    Ok(FrameOutput::DirectToSurface)
+                }
             } else {
                 Ok(FrameOutput::Pending)
             }
@@ -288,11 +312,11 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking
         .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
 
     let backend = get_or_create_backend();
- 
+
     std::thread::spawn(move || {
         // Останавливаем предыдущий runtime если он ещё жив
         stop_networking_inner();
- 
+        
         let addr_str = format!("{}:{}", host_str, port);
         let addr = match addr_str.to_socket_addrs() {
             Ok(mut iter) => match iter.next() {
@@ -307,7 +331,10 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking
                 return;
             }
         };
- 
+
+        let (trace_tx, trace_rx) = watch::channel(None);
+        let _ = TRACE_TX.set(trace_tx);
+        
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         let handle = rt.handle().clone();
  
@@ -321,7 +348,7 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking
             handle.block_on(async move {
                 // run_quic_receiver — бесконечный reconnect-loop
                 // frame_tx = None: кадры рендерятся прямо в Surface
-                if let Err(e) = crate::network::run_quic_receiver(backend, addr, None).await {
+                if let Err(e) = crate::network::run_quic_receiver(backend, addr, None, trace_rx).await {
                     log::error!("[Network] Fatal: {}", e);
                 }
             });

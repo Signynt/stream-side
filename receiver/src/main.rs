@@ -39,7 +39,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
-
+use tokio::sync::watch;
 use ash::vk;
 use common::FrameTrace;
 use tokio::sync::mpsc;
@@ -830,6 +830,7 @@ struct App {
     state:           Option<WgpuState>,
     window:          Option<Arc<Window>>,
     frame_rx:        mpsc::Receiver<DecodedFrame>,
+    trace_tx:        watch::Sender<Option<(u64, FrameTrace)>>,
     frames_rendered: u64,
 }
 
@@ -865,38 +866,32 @@ impl ApplicationHandler for App {
         if let Some(decoded) = self.poll_latest_frame() {
             if let Some(state) = self.state.as_mut() {
 
-                let (frame_id, mut trace) = match &decoded {
+                // 1. Вытаскиваем данные кадра заранее, пока decoded еще доступен
+                let (frame_id, frame_trace) = match &decoded {
                     DecodedFrame::Yuv(f)    => (f.frame_id, f.trace),
                     DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
                 };
 
+                // 2. Рендерим (поглощаем decoded)
                 match decoded {
                     DecodedFrame::Yuv(frame) => {
-                        // CPU-путь: пишем через queue.write_texture
                         state.update_textures_cpu(&frame);
                     }
                     DecodedFrame::DmaBuf(frame) => {
-                        // Zero-copy путь: импортируем DMA-BUF fd в Vulkan
                         if !state.update_textures_dmabuf(&frame) {
-                            // Vulkan import упал — пробрасываем через CPU (эмергентный fallback).
-                            // DmaBufFrame не содержит CPU данных, поэтому единственный вариант —
-                            // игнорировать этот кадр и ждать следующего.
-                            log::warn!(
-                                "[Render] DMA-BUF import failed for frame #{frame_id}; \
-                                 frame dropped. Check that VK_EXT_external_memory_dma_buf \
-                                 is available."
-                            );
+                            log::warn!("[Render] DMA-BUF import failed for frame #{}", frame_id);
                             return;
                         }
                     }
                 }
 
-                trace.present_us = FrameTrace::now_us();
-                self.frames_rendered += 1;
-                if frame_id % 120 == 0 {
-                    log_trace(frame_id, &trace);
+                // 3. Работаем с телеметрией, используя сохраненные переменные
+                let mut t = frame_trace;
+                if t.capture_us != 0 {
+                    t.present_us = FrameTrace::now_us();
+                    let _ = self.trace_tx.send(Some((frame_id, t)));
                 }
-
+                
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -962,6 +957,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend_clone = backend.clone();
     let tx_clone      = tx.clone();
 
+    let (trace_tx, trace_rx) = watch::channel::<Option<(u64, FrameTrace)>>(None);
+    
     // Сетевой поток.
     // Примечание: network.rs::receive_datagrams нужно обновить:
     //   FrameOutput::DmaBuf(frame) → tx.try_send(DecodedFrame::DmaBuf(frame))
@@ -976,7 +973,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
-                run_quic_receiver(backend_clone, addr, Some(tx_clone)).await;
+                run_quic_receiver(backend_clone, addr, Some(tx_clone), trace_rx).await;
             }));
         })?;
 
@@ -986,6 +983,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         state:           None,
         window:          None,
         frame_rx:        rx,
+        trace_tx:        trace_tx,
         frames_rendered: 0,
     };
     event_loop.run_app(&mut app)?;

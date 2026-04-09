@@ -1,7 +1,12 @@
 use serde::{Serialize, Deserialize};
 use bytes::{Bytes, BytesMut, BufMut};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{sync::atomic::AtomicI64, time::{SystemTime, UNIX_EPOCH}};
 
+
+pub const TYPE_VIDEO: u8 = 0;
+pub const TYPE_AUDIO: u8 = 1;
+pub const TYPE_CONTROL: u8 = 2;
+pub static CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
 // ─────────────────────────────────────────────────────────────────────────────
 // Wire types shared between sender and receiver
 // ─────────────────────────────────────────────────────────────────────────────
@@ -66,14 +71,15 @@ pub struct DatagramChunk {
     pub frame_id:     u64,
     pub chunk_idx:    u16,
     pub total_chunks: u16,
-    pub is_key:       bool,
+    pub flags:        u8,
+    pub packet_type:  u8,
     /// Zero-copy Bytes slice of the raw datagram payload.
     pub data:         Bytes,
 }
 
 impl DatagramChunk {
     /// Fixed header size in bytes.
-    pub const HEADER_LEN: usize = 13; // 8 + 2 + 2 + 1
+    pub const HEADER_LEN: usize = 14; // 8 + 2 + 2 + 1 + 1
 
     // ── Encoding ─────────────────────────────────────────────────────────────
 
@@ -82,12 +88,13 @@ impl DatagramChunk {
     /// `data` is appended verbatim after the 12-byte header — no extra copy
     /// is required if the caller already holds a contiguous `&[u8]`.
     #[inline]
-    pub fn encode(frame_id: u64, chunk_idx: u16, total_chunks: u16, data: &[u8], is_key: bool,) -> Bytes {
+    pub fn encode(frame_id: u64, idx: u16, total: u16, p_type: u8, flags: u8, data: &[u8]) -> Bytes {
         let mut buf = BytesMut::with_capacity(Self::HEADER_LEN + data.len());
         buf.put_u64_le(frame_id);
-        buf.put_u16_le(chunk_idx);
-        buf.put_u16_le(total_chunks);
-        buf.put_u8(u8::from(is_key));
+        buf.put_u16_le(idx);
+        buf.put_u16_le(total);
+        buf.put_u8(p_type); // Записываем тип
+        buf.put_u8(flags);  // Записываем флаги
         buf.put_slice(data);
         buf.freeze()
     }
@@ -104,17 +111,36 @@ impl DatagramChunk {
         if raw.len() < Self::HEADER_LEN {
             return None;
         }
-        let frame_id     = u64::from_le_bytes(raw[0..8].try_into().ok()?);
-        let chunk_idx    = u16::from_le_bytes(raw[8..10].try_into().ok()?);
-        let total_chunks = u16::from_le_bytes(raw[10..12].try_into().ok()?);
+        
+        // Читаем строго по индексам:
+        let frame_id     = u64::from_le_bytes(raw[0..8].try_into().ok()?);    // 0..8
+        let chunk_idx    = u16::from_le_bytes(raw[8..10].try_into().ok()?);   // 8..10
+        let total_chunks = u16::from_le_bytes(raw[10..12].try_into().ok()?);  // 10..12
+        let packet_type  = raw[12];                                           // 12
+        let flags        = raw[13];                                           // 13
+        
         let data         = raw.slice(Self::HEADER_LEN..);
-        let is_key       = raw[12] != 0;
-        Some(Self { frame_id, chunk_idx, total_chunks, is_key, data })
+        
+        Some(Self { 
+            frame_id, 
+            chunk_idx, 
+            total_chunks, 
+            packet_type, 
+            flags, 
+            data 
+        })
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ControlPacket {
+    Identify { 
+        model: String, 
+        os: String,  
+    },
+    StartStreaming,
     Ping { client_time_us: u64 },
     Pong { client_time_us: u64, server_time_us: u64 },
+    OffsetUpdate { offset_us: i64, rtt_us: u64 },
+    FrameFeedback { frame_id: u64, trace: FrameTrace },
 }

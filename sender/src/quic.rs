@@ -28,12 +28,14 @@
 //! | `Arc<Bytes>` fan-out | All clients share the same serialised buffer — zero copy after the first |
 //! | `keep_alive_interval` | Detects dead LAN peers quickly without waiting for idle timeout |
 
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use bytes::Bytes;
 use quinn::{Endpoint, ServerConfig};
 use quinn::crypto::rustls::QuicServerConfig;
-use tokio::sync::{broadcast, mpsc};
-use common::{ControlPacket, DatagramChunk, FrameTrace, VideoPacket};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
+use common::{CLOCK_OFFSET, ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
+use crate::{ClientIdentity, ConnectionInfo};
 use crate::encode::EncodedFrame;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,33 +109,64 @@ impl QuicServer {
                     match connecting.await {
                         Ok(conn) => {
                             log::info!("[QUIC] Client connected: {}", conn.remote_address());
-                            
-                            // Создаем отдельную задачу, которая слушает пинги от этого клиента
-                            let ctrl_conn = conn.clone();
+                            let (identity_tx, identity_rx) = watch::channel(ClientIdentity::default());
+                            let identity_tx_for_accept = identity_tx.clone();
+
+                            let info = Arc::new(ConnectionInfo {
+                                remote: conn.remote_address().to_string(),
+                                label: RwLock::new(conn.remote_address().to_string()),
+                                ready: AtomicBool::new(false),
+                            });
+                            let info_bi = info.clone();
+                            let info_uni = info.clone();
+                            let info_main   = info.clone();
+                            let clock_offset = Arc::new(AtomicI64::new(0));
+                            let clock_off_main = clock_offset.clone();
+
+                            //BI STREAM ACCEPT
+                            let conn_bi = conn.clone();
+                            let conn_uni = conn.clone();
                             tokio::spawn(async move {
                                 loop {
-                                    match ctrl_conn.read_datagram().await {
-                                        Ok(data) => {
-                                            if let Ok(ControlPacket::Ping { client_time_us }) = postcard::from_bytes(&data) {
-                                                let server_now = FrameTrace::now_us();
-                                                let delta_ms = (server_now as i64 - client_time_us as i64) as f64 / 1000.0;
-                                                
-                                                log::info!("[Sync] Client: {}, Raw Delta: {:.10} ms", ctrl_conn.remote_address(), delta_ms);
-
-                                                let pong = ControlPacket::Pong {
-                                                    client_time_us,
-                                                    server_time_us: server_now,
-                                                };
-                                                if let Ok(bytes) = postcard::to_stdvec(&pong) {
-                                                    let _ = ctrl_conn.send_datagram(bytes.into());
+                                    match conn_bi.accept_bi().await {
+                                        Ok((mut send, mut recv)) => {
+                                            let identity_tx = identity_tx_for_accept.clone();
+                                            let info_for_task = info_bi.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = handle_bi_stream(&mut send, &mut recv, identity_tx, info_for_task).await {
+                                                    log::warn!("bi stream error: {e}");
                                                 }
-                                            }
+                                            });
                                         }
-                                        Err(_) => break,
+                                        Err(e) => {
+                                            log::info!("accept_bi ended: {e}");
+                                            break;
+                                        }
                                     }
                                 }
                             });
-                            send_datagrams_to_client(conn, client_rx).await;
+
+                            tokio::spawn(async move {
+                                loop {
+                                    match conn_uni.accept_uni().await {
+                                        Ok(recv) => {
+                                            let info_for_task = info_uni.clone();
+                                            let clock_offset_task = clock_offset.clone();
+                                            tokio::spawn(async move {
+                                                if let Err(e) = handle_uni_stream(recv, info_for_task, clock_offset_task).await {
+                                                    log::warn!("bi stream error: {e}");
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            log::info!("accept_bi ended: {e}");
+                                            break;
+                                        }
+                                    }
+                                }
+                            });
+                            
+                            send_loop_to_client(conn, client_rx, info_main, &clock_off_main).await;
                         }
                         Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),
                     }
@@ -173,88 +206,216 @@ impl QuicServer {
 // Per-client send loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn send_datagrams_to_client(
-    conn:    quinn::Connection,
-    mut rx:  broadcast::Receiver<Arc<(u64, Bytes, bool)>>,
+async fn send_loop_to_client(
+    conn: quinn::Connection,
+    mut video_rx: broadcast::Receiver<Arc<(u64, Bytes, bool)>>,
+    info: Arc<ConnectionInfo>,
+    clock_offset: &AtomicI64
 ) {
-    // Wait for the first IDR frame before sending anything.
-    // This prevents the receiver from trying to decode a partial GOP.
     let mut started = false;
-
-    // Cache the usable datagram payload size for this connection.
-    // MTU negotiation completes during the handshake; after that the value is
-    // stable for the lifetime of the connection on a non-changing path.
-    //
-    // 12 bytes: DatagramChunk fixed header (see DatagramChunk::encode).
-    // We subtract a further 8 bytes of QUIC framing margin.
-    let max_chunk_data = conn
-        .max_datagram_size()
-        .unwrap_or(1200)
-        .saturating_sub(DatagramChunk::HEADER_LEN + 8);
-
     let remote = conn.remote_address();
+    
+    // Заранее считаем лимиты
+    let max_dgram = conn.max_datagram_size().unwrap_or(1200);
+    let max_chunk_data = max_dgram.saturating_sub(DatagramChunk::HEADER_LEN + 8);
 
+    
     loop {
-        let msg = match rx.recv().await {
-            Ok(m) => m,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                log::warn!("[QUIC] Client {remote} lagged {n} frames, resetting to next IDR");
-                started = false;
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
-        };
+        tokio::select! {
+            // 1. ОТПРАВКА ВИДЕО
+            
+            video_result = video_rx.recv() => {
+                match video_result {
+                    Ok(msg) => {
+                        if !info.ready.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let (frame_id, ref data, is_key) = *msg;
+                        if !started {
+                            if !is_key { continue; }
+                            started = true;
+                        }
+                        
+                        let flags = if is_key { 1 } else { 0 };
+                        let total_chunks = ((data.len() + max_chunk_data - 1) / max_chunk_data) as u16;
 
-        let (frame_id, ref data, is_key) = *msg;
-
-        if !started {
-            if !is_key { continue; }
-            started = true;
-            log::info!("[QUIC] Streaming to {remote} from IDR #{frame_id}");
-        }
-
-        let total_chunks = ((data.len() + max_chunk_data - 1) / max_chunk_data) as u16;
-
-        if frame_id % 120 == 0 {
-            let stats = conn.stats();
-            log::info!(
-                "[QUIC Sender Stats] Frame #{frame_id}: RTT = {}ms, Sent Bytes = {}, CWND = {}, Lost = {}",
-                stats.path.rtt.as_millis(),
-                stats.udp_tx.bytes,          // Сколько всего ушло
-                stats.path.cwnd,             // Текущее окно перегрузки
-                stats.path.lost_packets      // Потерянные пакеты
-            );
-        }
-
-        for (idx, offset) in (0..data.len()).step_by(max_chunk_data).enumerate() {
-            let end   = (offset + max_chunk_data).min(data.len());
-            // Zero-copy Bytes slice — no allocation for the payload.
-            let slice = data.slice(offset..end);
-
-            let dgram = DatagramChunk::encode(
-                frame_id,
-                idx as u16,
-                total_chunks,
-                &slice,
-                is_key,
-            );
-
-            match conn.send_datagram(dgram) {
-                Ok(_) => {}
-                Err(quinn::SendDatagramError::TooLarge) => {
-                    // Should not happen after subtracting header + margin, but
-                    // if it does, skip this chunk rather than killing the stream.
-                    log::debug!("[QUIC] Datagram too large for frame #{frame_id} chunk {idx}");
-                }
-                Err(e) => {
-                    log::info!("[QUIC] Client {remote} disconnected: {e}");
-                    return;
+                        for (idx, offset) in (0..data.len()).step_by(max_chunk_data).enumerate() {
+                            let end = (offset + max_chunk_data).min(data.len());
+                            let dgram = DatagramChunk::encode(
+                                frame_id, idx as u16, total_chunks, 
+                                TYPE_VIDEO, flags, &data.slice(offset..end)
+                            );
+                            if let Err(_) = conn.send_datagram(dgram) { break; }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("[QUIC] Client {remote} lagged {n} frames, resetting to next IDR");
+                        started = false;  // ← сброс, ждём IDR
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+
+            // 2. ПРИЕМ КОМАНД ОТ КЛИЕНТА (Ping, RequestKeyFrame, и т.д.)
+            incoming = conn.read_datagram() => {
+                match incoming {
+                    Ok(raw_data) => {
+                        // Декодируем как наш чанк (клиент тоже шлет в этом формате)
+                        if let Some(chunk) = DatagramChunk::decode(raw_data) {
+                            if chunk.packet_type == TYPE_CONTROL {
+                                handle_control(&conn, chunk.data, &info, clock_offset).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::info!("[QUIC] Client {remote} read error: {e}");
+                        break;
+                    }
+                }
+            }
+            
+            // 3. (В БУДУЩЕМ) ОТПРАВКА АУДИО
+            // Ok(audio_msg) = audio_rx.recv() => { ... }
         }
     }
+}
 
-    log::info!("[QUIC] Client {remote} stream closed");
+async fn handle_bi_stream(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    identity_tx: watch::Sender<ClientIdentity>,
+    info: Arc<ConnectionInfo>
+) -> Result<(), Box<dyn std::error::Error>> {
+
+    // читаем длину
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut data = vec![0u8; len];
+    recv.read_exact(&mut data).await?;
+
+    let packet: ControlPacket = postcard::from_bytes(&data)?;
+
+    match packet {
+        ControlPacket::Identify { model, os } => {
+            log::info!("[QUIC] IDENTIFY via stream: {model} [{os}]");
+
+            let mut id = identity_tx.borrow().clone();
+            id.model = Some(model.clone()); 
+            id.os = Some(os.clone());
+            id.ready = true;
+            let _ = identity_tx.send(id);
+
+            let label = format!("{} [{} {}]", info.remote, model, os);
+
+            {
+                let mut l = info.label.write().await;
+                *l = label;
+            }
+
+            info.ready.store(true, Ordering::Release);
+            let reply = ControlPacket::StartStreaming;
+            let bytes = postcard::to_stdvec(&reply)?;
+
+            send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+            send.write_all(&bytes).await?;
+            send.finish()?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn handle_uni_stream(
+    mut recv: quinn::RecvStream,
+    info: Arc<ConnectionInfo>,
+    clock_offset: Arc<AtomicI64>
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if let Err(e) = recv.read_exact(&mut len_buf).await {
+            log::info!("Stream closed: {:?}", e);
+            break; 
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut data = vec![0u8; len];
+        recv.read_exact(&mut data).await?;
+        let packet: ControlPacket = match postcard::from_bytes(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                let label = info.label().await;
+                log::error!("[QUIC UNI] ERROR FOR {label}: {:?}", e);
+                continue; // Выходим из текущей итерации цикла
+            }
+        };
+        
+        match packet {
+            ControlPacket::FrameFeedback { frame_id, trace } => {
+            let t = trace;
+            let label = info.label().await;
+
+            let receive_srv     = client_to_server_us(t.receive_us, &clock_offset);
+            let reassembled_srv = client_to_server_us(t.reassembled_us, &clock_offset);
+            let decode_srv      = client_to_server_us(t.decode_us, &clock_offset);
+            let present_srv     = client_to_server_us(t.present_us, &clock_offset);
+            let off = clock_offset.load(Ordering::Relaxed);
+
+            log::info!(
+                "[QUIC] {label} got frame trace. Offset is: {off}:
+                #{frame_id}: capture→encode={:.1}ms encode→serial={:.1}ms \
+                serial→recv={:.1}ms recv→reassem={:.1}ms reassem→decode={:.1}ms \
+                decode→present={:.1}ms  TOTAL={:.1}ms",
+                FrameTrace::ms(t.capture_us, t.encode_us),
+                FrameTrace::ms(t.encode_us, t.serialize_us),
+                FrameTrace::ms(t.serialize_us, receive_srv),
+                FrameTrace::ms(receive_srv, reassembled_srv),
+                FrameTrace::ms(reassembled_srv, decode_srv),
+                FrameTrace::ms(decode_srv, present_srv),
+                FrameTrace::ms(t.capture_us, present_srv),
+            );
+        }
+        _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn client_to_server_us(t: u64, clock_offset: &AtomicI64) -> u64 {
+    let off = clock_offset.load(Ordering::Relaxed);
+    if off >= 0 {
+        t.saturating_add(off as u64)
+    } else {
+        t.saturating_sub((-off) as u64)
+    }
+}
+
+async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &ConnectionInfo, clock_offset: &AtomicI64) {
+    if let Ok(packet) = postcard::from_bytes::<ControlPacket>(&data) {
+        match packet {
+            ControlPacket::Ping { client_time_us } => {
+                let pong = ControlPacket::Pong {
+                    client_time_us,
+                    server_time_us: FrameTrace::now_us(),
+                };
+                if let Ok(bin) = postcard::to_stdvec(&pong) {
+                    // Отправляем ответ как TYPE_CONTROL
+                    let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bin);
+                    let _ = conn.send_datagram(dgram);
+                }
+            },
+            ControlPacket::Pong{..} => (),
+            ControlPacket::OffsetUpdate { offset_us, rtt_us } => {
+                clock_offset.store(offset_us, Ordering::Relaxed);
+                log::info!("[{}] RTT: {:.1}ms", info.label().await, rtt_us as f64 / 1000.0);
+            }
+            _ => ()
+            // Здесь будет ControlPacket::RequestKeyFrame -> отправка в mpsc энкодера
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

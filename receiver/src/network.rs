@@ -32,11 +32,11 @@ use std::{
     time::Duration,
 };
 use std::sync::atomic::{AtomicI64, Ordering};
-
+use tokio::sync::watch;
 use tokio::sync::mpsc;
 use bytes::Bytes;
-use common::{ControlPacket, DatagramChunk, FrameTrace, VideoPacket};
-use quinn::Endpoint;
+use common::{CLOCK_OFFSET, ControlPacket, DatagramChunk, FrameTrace, TYPE_AUDIO, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
+use quinn::{Endpoint, SendStream};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::DigitallySignedStruct;
@@ -45,31 +45,14 @@ use crate::{backend::{FrameOutput, VideoBackend}, types::DecodedFrame};
 // ─────────────────────────────────────────────────────────────────────────────
 // Datagram reassembly buffer
 // ─────────────────────────────────────────────────────────────────────────────
-pub static CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
 // Коэффициент сглаживания: 0.1 значит, что новый замер влияет на 10%, 
 // а старое значение сохраняется на 90%.
-const OFFSET_ALPHA: f64 = 0.2;
-
-async fn start_ping_loop(connection: quinn::Connection) {
-    let mut count = 0;
-    loop {
-        let t1 = FrameTrace::now_us();
-        let ping = ControlPacket::Ping { client_time_us: t1 };
-        if let Ok(bytes) = postcard::to_stdvec(&ping) {
-            let _ = connection.send_datagram(bytes.into());
-        }
-        
-        count += 1;
-        let delay = if count < 10 {
-            Duration::from_millis(200) // Быстрая калибровка при старте
-        } else {
-            Duration::from_secs(3)      // Редкое обновление для поддержки
-        };
-        
-        tokio::time::sleep(delay).await;
-    }
+const OFFSET_ALPHA: f64 = 0.01;
+struct VideoState {
+    reassembly: HashMap<u64, ReassemblyBuf>,
+    waiting_for_key: bool,
+    expected_frame_id: Option<u64>,
 }
-
 struct ReassemblyBuf {
     /// Slot per chunk index; `None` until the chunk arrives.
     chunks:   Vec<Option<Bytes>>,
@@ -136,7 +119,8 @@ impl ReassemblyBuf {
 pub async fn run_quic_receiver<B: VideoBackend>(
     backend:     Arc<Mutex<B>>,
     sender_addr: SocketAddr,
-    frame_tx: Option<mpsc::Sender<DecodedFrame>>
+    frame_tx: Option<mpsc::Sender<DecodedFrame>>,
+    mut trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
 ) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
 
@@ -165,9 +149,101 @@ pub async fn run_quic_receiver<B: VideoBackend>(
 
         log::info!("[QUIC] Connected to {}", conn.remote_address());
 
-        let ping_conn = conn.clone();
-        tokio::spawn(start_ping_loop(ping_conn));
+        let (send, mut recv) = match conn.open_bi().await {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("open_bi failed: {e}");
+                continue;
+            }
+        };
+        send_identity(send).await;
 
+        let mut len_buf = [0u8; 4];
+        if let Err(e) = recv.read_exact(&mut len_buf).await {
+            log::error!("failed to read ack len: {e}");
+            continue;
+        }
+
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut data = vec![0u8; len];
+
+        if let Err(e) = recv.read_exact(&mut data).await {
+            log::error!("failed to read ack body: {e}");
+            continue;
+        }
+
+        match postcard::from_bytes::<ControlPacket>(&data) {
+            Ok(ControlPacket::StartStreaming) => {
+                log::info!("[QUIC] Server ACK → start streaming");
+            }
+            Ok(other) => {
+                log::warn!("unexpected packet: {:?}", other);
+                continue;
+            }
+            Err(e) => {
+                log::error!("decode error: {e}");
+                continue;
+            }
+        }
+        
+        let mut uni_send = match conn.open_uni().await {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("open_uni failed: {e}");
+                continue;
+            }
+        };
+
+        let trace_rx_clone = trace_rx.clone();
+        tokio::spawn(async move {
+            // Таймер: раз в 1 секунду (можешь поменять на 2 или 0.5)
+            let mut interval = tokio::time::interval(Duration::from_millis(1500));
+            let mut last_sent_id = 0;
+
+            loop {
+                interval.tick().await; // Ждем тик таймера
+
+                // Берем самый свежий трейс из канала
+                let latest = *trace_rx_clone.borrow(); 
+                
+                if let Some((frame_id, trace)) = latest {
+                    // Чтобы не слать один и тот же кадр, если видео зависло
+                    if frame_id != last_sent_id { 
+                        last_sent_id = frame_id;
+
+                        let packet = ControlPacket::FrameFeedback { frame_id, trace };
+                        if let Ok(bytes) = postcard::to_stdvec(&packet) {
+                            let len = (bytes.len() as u32).to_le_bytes();
+                            
+                            // Пишем в стрим длину и тело.
+                            // Если вернулась ошибка - стрим/коннект умер, выходим из лупа.
+                            if uni_send.write_all(&len).await.is_err() { break; }
+                            if uni_send.write_all(&bytes).await.is_err() { break; }
+                        }
+                    }
+                }
+            }
+            log::debug!("[QUIC] Feedback stream loop exited");
+        });
+
+        let ping_conn = conn.clone();
+        tokio::spawn(async move {
+            let mut count = 0;
+            loop {
+                let ping = ControlPacket::Ping { client_time_us: FrameTrace::now_us() };
+                if let Ok(bytes) = postcard::to_stdvec(&ping) {
+                    let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bytes);
+                    let _ = ping_conn.send_datagram(dgram);
+                }
+                count += 1;
+                let delay = if count < 10 {
+                    Duration::from_millis(200)
+                } else {
+                    Duration::from_secs(3)
+                };
+                tokio::time::sleep(delay).await;
+            }
+        });
         receive_datagrams(conn, backend.clone(), frame_tx.clone()).await;
         log::warn!("[QUIC] Connection lost, reconnecting in 2 s...");
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -175,164 +251,286 @@ pub async fn run_quic_receiver<B: VideoBackend>(
     }
 }
 
+async fn send_identity(mut send: SendStream) {
+    let identify = make_client_identity();
+    let bytes = postcard::to_stdvec(&identify).unwrap();
+    if let Err(e) = send.write_all(&(bytes.len() as u32).to_le_bytes()).await {
+        log::error!("write len failed: {e}");
+        return;
+    }
+
+    if let Err(e) = send.write_all(&bytes).await {
+        log::error!("write body failed: {e}");
+        return;
+    }
+    let _ = send.finish();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-connection datagram loop
 // ─────────────────────────────────────────────────────────────────────────────
+
+pub async fn send_offset_update(conn: &quinn::Connection, rtt_us: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let offset = CLOCK_OFFSET.load(Ordering::Relaxed);
+    let packet = ControlPacket::OffsetUpdate { offset_us: offset, rtt_us };
+
+    let bin = postcard::to_stdvec(&packet)?;
+    let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bin);
+    conn.send_datagram(dgram)?;
+
+    Ok(())
+}
 
 async fn receive_datagrams<B: VideoBackend>(
     conn:     quinn::Connection,
     backend:  Arc<Mutex<B>>,
     frame_tx: Option<mpsc::Sender<DecodedFrame>>
 ) {
-    let mut waiting_for_key = false;
-    let mut expected_frame_id: Option<u64> = None;
-    const MAX_BUFFERED_FRAMES: usize = 8;
-
-    let mut reassembly: HashMap<u64, ReassemblyBuf> = HashMap::new();
+    let mut video_state = VideoState {
+        reassembly: HashMap::new(),
+        waiting_for_key: true,
+        expected_frame_id: None,
+    };
 
     loop {
-        let raw: Bytes = match conn.read_datagram().await {
-            Ok(b)  => b,
+        let raw = match conn.read_datagram().await {
+            Ok(b) => b,
             Err(e) => {
-                log::info!("[QUIC] read_datagram: {e}");
+                log::error!("QUIC READ ERROR: {:?}", e);
                 break;
             }
         };
-        if raw.len() < 100 {
-            if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&raw) {
-                if let ControlPacket::Pong { client_time_us, server_time_us } = ctrl {
-                    let t2 = FrameTrace::now_us();
-                    let rtt = t2.saturating_sub(client_time_us);
-                    
-                    // 1. Считаем мгновенное значение (как и раньше)
-                    let new_raw_offset = (server_time_us as i64) - (client_time_us + rtt / 2) as i64;
-                    
-                    // 2. Берем текущее сглаженное значение
-                    let current_offset = CLOCK_OFFSET.load(Ordering::Relaxed);
-                    
-                    let filtered_offset = if current_offset == 0 {
-                        // Если это самый первый замер — сохраняем как есть
-                        new_raw_offset
-                    } else {
-                        // Формула EMA: filtered = current + alpha * (new - current)
-                        let filtered = current_offset as f64 + OFFSET_ALPHA * (new_raw_offset - current_offset) as f64;
-                        filtered as i64
-                    };
-                    
-                    CLOCK_OFFSET.store(filtered_offset, Ordering::Relaxed);
-                    
-                    log::debug!(
-                        "[Sync] RTT: {}ms, Raw: {}us, Filtered: {}us", 
-                        rtt as f64 / 1000.0, new_raw_offset, filtered_offset
-                    );
-                    continue;
-                }
-            }
-        }
+        log::trace!("Got packet: {} bytes", raw.len()); // Видим, что данные вообще идут?
+        
         let chunk = match DatagramChunk::decode(raw) {
             Some(c) => c,
-            None    => continue,
-        };
-
-        let frame_id = chunk.frame_id;
-
-        if chunk.is_key && chunk.chunk_idx == 0 {
-            for (id, buf) in reassembly.drain() {
-                let missing = buf.total - buf.received;
-                if missing > 0 {
-                    log::debug!("[Reassembly] Clearing incomplete frame #{} for new IDR (missing {} chunks)", id, missing);
-                }
-            }
-        }
-
-        reassembly.retain(|&id, buf| {
-            let keep = buf.is_key || id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64);
-            if !keep {
-                waiting_for_key = true;
-            }
-            keep
-        });
-
-        if reassembly.len() >= MAX_BUFFERED_FRAMES {
-            let evict_id = reassembly.iter().filter(|(_, buf)| !buf.is_key).map(|(&id, _)| id).min()
-                .or_else(|| reassembly.keys().copied().min());
-            if let Some(id) = evict_id {
-                reassembly.remove(&id);
-            }
-        }
-
-        let buf = reassembly.entry(frame_id).or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks, chunk.is_key));
-
-        if chunk.chunk_idx >= buf.total || chunk.total_chunks != buf.total { continue; }
-
-        // Если не все куски собраны — уходим на следующую итерацию
-        if !buf.insert(chunk.chunk_idx, chunk.data) { continue; }
-
-        // === КАДР СОБРАН ===
-        let buf = reassembly.remove(&frame_id).unwrap();
-        let first_us = buf.first_us;
-        let serialised = buf.assemble();
-
-        let mut packet: VideoPacket = match postcard::from_bytes(&serialised) {
-            Ok(p)  => p,
-            Err(_) => continue,
-        };
-        
-        packet.trace.as_mut().map(|t| {
-            t.receive_us     = first_us;
-            t.reassembled_us = FrameTrace::now_us();
-        });
-
-        // === ИНЛАЙН ДЕКОДИРОВАНИЕ ===
-        // Берем лок, закидываем кадр, забираем YUV и СРАЗУ отдаем лок.
-        let mut backend_lock = backend.lock().unwrap();
-
-        if packet.is_key {
-            waiting_for_key = false;
-            expected_frame_id = Some(packet.frame_id);
-        } else if waiting_for_key {
-            continue;
-        } else if packet.frame_id != expected_frame_id.unwrap_or_default() {
-            log::warn!("[Decoder] Sequence broken. Dropping frames until next IDR.");
-            waiting_for_key = true;
-            continue;
-        }
-        expected_frame_id = Some(packet.frame_id + 1);
-
-        match backend_lock.push_encoded(&packet.payload, packet.frame_id, packet.trace.take()) {
-            Ok(()) => {}
-            Err(crate::backend::BackendError::BufferFull) => {
-                waiting_for_key = true;
+            None => {
+                log::warn!("Failed to decode chunk header");
                 continue;
             }
-            Err(_) => {
-                waiting_for_key = true;
-                continue;
-            }
-        }
+        };
 
-        loop {
-            match backend_lock.poll_output() {
-                Ok(FrameOutput::Yuv(frame)) => {
-                    if let Some(ref tx) = frame_tx {
-                        let _ = tx.try_send(DecodedFrame::Yuv(frame));
-                    }
-                }
-                Ok(FrameOutput::DmaBuf(frame)) => {
-                    // Zero-copy путь: VASurface уже экспортирован как DMA-BUF fd.
-                    // render-поток импортирует его в Vulkan без CPU-участия.
-                    if let Some(ref tx) = frame_tx {
-                        let _ = tx.try_send(DecodedFrame::DmaBuf(frame));
-                    }
-                }
-                Ok(FrameOutput::DirectToSurface) => {}
-                Ok(FrameOutput::Pending) | Err(_) => break,
+        match chunk.packet_type {
+            TYPE_VIDEO => {
+                handle_video_chunk(chunk, &mut video_state, &backend, &frame_tx).await;
             }
+            TYPE_AUDIO => {
+                // Аудио не ждет сборки видео! Пролетает сразу.
+                // handle_audio_frame(chunk.data); 
+            }
+            TYPE_CONTROL => {
+                if let Ok(ctrl) = postcard::from_bytes::<ControlPacket>(&chunk.data) {
+                    if let Some((_, rtt_us)) = process_control_feedback(ctrl) {
+                        // Сразу после вычисления нового offset — слать на сервер
+                        let conn_clone = conn.clone();
+                        tokio::spawn(async move {
+                            let _ = send_offset_update(&conn_clone, rtt_us).await;
+                        });
+                    }
+                }
+            }
+            _ => log::warn!("Unknown packet type"),
         }
-        drop(backend_lock); // Важно освободить Mutex ДО того, как уйдем на conn.read_datagram().await!
     }
 }
 
+fn make_client_identity() -> ControlPacket {
+    let os = if cfg!(target_os = "android") {
+        "Android"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Unknown"
+    }
+    .to_string();
+
+    let (model, name) = if cfg!(target_os = "android") {
+        android_identity()
+    } else if cfg!(target_os = "windows") {
+        windows_identity()
+    } else if cfg!(target_os = "macos") {
+        macos_identity()
+    } else if cfg!(target_os = "linux") {
+        linux_identity()
+    } else {
+        unknown_identity()
+    };
+
+    // Если ControlPacket пока содержит только model/os,
+    // склеиваем model + name в одно поле.
+    let model = if name.is_empty() {
+        model
+    } else {
+        format!("{model} ({name})")
+    };
+
+    ControlPacket::Identify { model, os }
+}
+
+fn android_identity() -> (String, String) {
+    let model = std::env::var("CLIENT_MODEL")
+        .or_else(|_| std::env::var("ANDROID_MODEL"))
+        .unwrap_or_else(|_| "Android device".to_string());
+
+    let name = std::env::var("CLIENT_NAME")
+        .or_else(|_| std::env::var("ANDROID_DEVICE_NAME"))
+        .unwrap_or_else(|_| "Android".to_string());
+
+    (model, name)
+}
+
+fn windows_identity() -> (String, String) {
+    let model = std::env::var("CLIENT_MODEL")
+        .unwrap_or_else(|_| format!("{} {}", std::env::consts::ARCH, "Windows"));
+
+    let name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("CLIENT_NAME"))
+        .unwrap_or_else(|_| "Windows-PC".to_string());
+
+    (model, name)
+}
+
+fn macos_identity() -> (String, String) {
+    let model = std::env::var("CLIENT_MODEL")
+        .unwrap_or_else(|_| "Mac".to_string());
+
+    let name = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("CLIENT_NAME"))
+        .unwrap_or_else(|_| "Mac".to_string());
+
+    (model, name)
+}
+
+fn linux_identity() -> (String, String) {
+    let model = std::env::var("CLIENT_MODEL")
+        .unwrap_or_else(|_| format!("Linux {}", std::env::consts::ARCH));
+
+    let name = std::env::var("$HOSTNAME")
+        .or_else(|_| std::env::var("$CLIENT_NAME"))
+        .unwrap_or_else(|_| "Linux-host".to_string());
+
+    (model, name)
+}
+
+fn unknown_identity() -> (String, String) {
+    let model = std::env::var("CLIENT_MODEL").unwrap_or_else(|_| "Unknown device".to_string());
+    let name = std::env::var("CLIENT_NAME").unwrap_or_else(|_| "Unknown".to_string());
+    (model, name)
+}
+
+fn process_control_feedback(ctrl: ControlPacket) -> Option<(i64, u64)> {
+    if let ControlPacket::Pong { client_time_us, server_time_us } = ctrl {
+        let t2 = FrameTrace::now_us();
+        let rtt = t2.saturating_sub(client_time_us);
+
+        let new_raw_offset = (server_time_us as i64) - (client_time_us + rtt / 2) as i64;
+        let current_offset = CLOCK_OFFSET.load(Ordering::Relaxed);
+
+        let filtered_offset = if current_offset == 0 {
+            new_raw_offset
+        } else {
+            (current_offset as f64 + OFFSET_ALPHA * (new_raw_offset - current_offset) as f64) as i64
+        };
+
+        CLOCK_OFFSET.store(filtered_offset, Ordering::Relaxed);
+        log::debug!("[Sync] RTT: {}ms, Offset: {}us", rtt as f64 / 1000.0, filtered_offset);
+        Some((filtered_offset, rtt))
+    } else {
+        None
+    }
+}
+
+async fn handle_video_chunk<B: VideoBackend>(
+    chunk: DatagramChunk,
+    state: &mut VideoState,
+    backend: &Arc<Mutex<B>>,
+    frame_tx: &Option<mpsc::Sender<DecodedFrame>>,
+) {
+    let frame_id = chunk.frame_id;
+    let is_key = chunk.flags & 1 != 0;
+    const MAX_BUFFERED_FRAMES: usize = 8;
+
+    // 1. ЗАЩИТА ОТ ПАНИКИ: проверяем индексы
+    if chunk.chunk_idx >= chunk.total_chunks {
+        log::warn!("[Video] Drop corrupted chunk: idx {} >= total {}", chunk.chunk_idx, chunk.total_chunks);
+        return;
+    }
+
+    // 2. Логика сброса при IDR
+    if is_key && chunk.chunk_idx == 0 {
+        if !state.reassembly.contains_key(&frame_id) {
+            state.reassembly.clear(); 
+        }
+    }
+
+    // 3. Эвикция старых кадров
+    state.reassembly.retain(|&id, _| id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64));
+
+    // 4. Вставка чанка
+    let buf = state.reassembly.entry(frame_id)
+        .or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks, is_key));
+    
+    if !buf.insert(chunk.chunk_idx, chunk.data) { return; }
+
+    // 5. Кадр собран — десериализация
+    let buf = state.reassembly.remove(&frame_id).unwrap();
+    let first_us = buf.first_us;
+    
+    let mut packet: VideoPacket = match postcard::from_bytes(&buf.assemble()) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("[Video] Postcard decode error: {}", e);
+            return;
+        }
+    };
+
+    packet.trace.as_mut().map(|t| {
+        t.receive_us = first_us;
+        t.reassembled_us = FrameTrace::now_us();
+    });
+
+    // 6. Декодирование (ИЗОЛИРОВАННЫЙ ЛОК)
+    // Мы собираем кадры в локальный вектор, чтобы отпустить Mutex МГНОВЕННО
+    let mut decoded_frames = Vec::new();
+    
+    { // <-- Начало зоны Mutex
+        let mut backend_lock = backend.lock().unwrap();
+        
+        if packet.is_key {
+            state.waiting_for_key = false;
+            state.expected_frame_id = Some(packet.frame_id);
+        } else if state.waiting_for_key || Some(packet.frame_id) != state.expected_frame_id {
+            state.waiting_for_key = true;
+            return; // Лок освобождается здесь
+        }
+        state.expected_frame_id = Some(packet.frame_id + 1);
+
+        if backend_lock.push_encoded(&packet.payload, packet.frame_id, packet.trace.take()).is_ok() {
+            loop {
+                match backend_lock.poll_output() {
+                    Ok(FrameOutput::Pending) => break,  // декодер ещё не готов — выходим
+                    Ok(frame) => decoded_frames.push(frame),
+                    Err(_) => break,
+                }
+            }
+        }
+    } // <-- Конец зоны Mutex. Теперь бэкенд свободен для рендер-потока.
+
+    // 7. Отправка в канал ВНЕ лока
+    if let Some(tx) = frame_tx {
+        for frame in decoded_frames {
+            let _ = match frame {
+                FrameOutput::Yuv(f) => tx.try_send(DecodedFrame::Yuv(f)),
+                FrameOutput::DmaBuf(f) => tx.try_send(DecodedFrame::DmaBuf(f)),
+                _ => Ok(()),
+            };
+        }
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Client endpoint construction
 // ─────────────────────────────────────────────────────────────────────────────

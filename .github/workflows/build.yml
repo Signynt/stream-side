@@ -58,7 +58,7 @@ jobs:
         shell: bash
         run: |
           # Собираем
-          cargo build -p receiver --release
+          cargo build -p receiver --release --features="desktop"
           
           # Копируем DLL из vcpkg прямо к экзешнику
           # Это нужно и для артефакта, и чтобы экзешник вообще запустился у пользователя
