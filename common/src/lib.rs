@@ -143,4 +143,5 @@ pub enum ControlPacket {
     Pong { client_time_us: u64, server_time_us: u64 },
     OffsetUpdate { offset_us: i64, rtt_us: u64 },
     FrameFeedback { frame_id: u64, trace: FrameTrace },
+    Communication {message: String },
 }

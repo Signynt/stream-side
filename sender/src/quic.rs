@@ -355,29 +355,33 @@ async fn handle_uni_stream(
         
         match packet {
             ControlPacket::FrameFeedback { frame_id, trace } => {
-            let t = trace;
-            let label = info.label().await;
+                let t = trace;
+                let label = info.label().await;
 
-            let receive_srv     = client_to_server_us(t.receive_us, &clock_offset);
-            let reassembled_srv = client_to_server_us(t.reassembled_us, &clock_offset);
-            let decode_srv      = client_to_server_us(t.decode_us, &clock_offset);
-            let present_srv     = client_to_server_us(t.present_us, &clock_offset);
-            let off = clock_offset.load(Ordering::Relaxed);
+                let receive_srv     = client_to_server_us(t.receive_us, &clock_offset);
+                let reassembled_srv = client_to_server_us(t.reassembled_us, &clock_offset);
+                let decode_srv      = client_to_server_us(t.decode_us, &clock_offset);
+                let present_srv     = client_to_server_us(t.present_us, &clock_offset);
+                let off = clock_offset.load(Ordering::Relaxed);
 
-            log::info!(
-                "[QUIC] {label} got frame trace. Offset is: {off}:
-                #{frame_id}: capture→encode={:.1}ms encode→serial={:.1}ms \
-                serial→recv={:.1}ms recv→reassem={:.1}ms reassem→decode={:.1}ms \
-                decode→present={:.1}ms  TOTAL={:.1}ms",
-                FrameTrace::ms(t.capture_us, t.encode_us),
-                FrameTrace::ms(t.encode_us, t.serialize_us),
-                FrameTrace::ms(t.serialize_us, receive_srv),
-                FrameTrace::ms(receive_srv, reassembled_srv),
-                FrameTrace::ms(reassembled_srv, decode_srv),
-                FrameTrace::ms(decode_srv, present_srv),
-                FrameTrace::ms(t.capture_us, present_srv),
-            );
-        }
+                log::info!(
+                    "[QUIC] {label} got frame trace. Offset is: {off}:
+                    #{frame_id}: capture→encode={:.1}ms encode→serial={:.1}ms \
+                    serial→recv={:.1}ms recv→reassem={:.1}ms reassem→decode={:.1}ms \
+                    decode→present={:.1}ms  TOTAL={:.1}ms",
+                    FrameTrace::ms(t.capture_us, t.encode_us),
+                    FrameTrace::ms(t.encode_us, t.serialize_us),
+                    FrameTrace::ms(t.serialize_us, receive_srv),
+                    FrameTrace::ms(receive_srv, reassembled_srv),
+                    FrameTrace::ms(reassembled_srv, decode_srv),
+                    FrameTrace::ms(decode_srv, present_srv),
+                    FrameTrace::ms(t.capture_us, present_srv),
+                );
+            }
+            ControlPacket::Communication { message } => {
+                let label = info.label().await;
+                log::info!("[QUIC] {label} send a MESSAGE: {message}");
+            }
         _ => {}
         }
     }

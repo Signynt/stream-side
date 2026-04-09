@@ -40,6 +40,8 @@
 //! PipeWire mainloop исполняется на выделенном OS-потоке, т.к.
 //! `mainloop.run()` — блокирующий C-вызов. `oneshot`-канал пробрасывает
 //! фатальные ошибки обратно в async-мир.
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     os::{fd::FromRawFd, unix::io::IntoRawFd},
@@ -94,14 +96,21 @@ impl super::VideoSender for LinuxPipeWireSender {
     type Error = SenderError;
 
     async fn run(
-        self,
+        mut self,
         sink: mpsc::Sender<EncodedFrame>,
     ) -> Result<(), SenderError> {
-        let (node_id, raw_fd) = run_portal()
+        let (node_id, raw_fd, portal_size) = run_portal()
             .await
             .map_err(|e| SenderError::CaptureInit(e.to_string()))?;
 
         let (err_tx, err_rx) = oneshot::channel::<SenderError>();
+
+        if let Some((w, h)) = portal_size {
+            log::info!("[Portal] Detected target size: {}x{}", w, h);
+            self.width = w as u32;
+            self.height = h as u32;
+        }
+
         let width  = self.width;
         let height = self.height;
         let rt_handle = tokio::runtime::Handle::current();
@@ -127,7 +136,7 @@ impl super::VideoSender for LinuxPipeWireSender {
 // Portal negotiation
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn run_portal() -> ashpd::Result<(u32, i32)> {
+async fn run_portal() -> ashpd::Result<(u32, i32, Option<(i32, i32)>)> {
     let proxy   = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
 
@@ -142,10 +151,12 @@ async fn run_portal() -> ashpd::Result<(u32, i32)> {
     .await?;
 
     let response = proxy.start(&session, None, Default::default()).await?.response()?;
+    let stream = &response.streams()[0];
     let node_id  = response.streams()[0].pipe_wire_node_id();
     let fd       = proxy.open_pipe_wire_remote(&session, Default::default()).await?;
+    let size = stream.size();
 
-    Ok((node_id, fd.into_raw_fd()))
+    Ok((node_id, fd.into_raw_fd(), size))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,7 +186,13 @@ fn run_pipewire(
 
     let current_modifier = Arc::new(AtomicU64::new(0)); 
     let modifier_for_param = current_modifier.clone();
+    
+    let pw_width  = Rc::new(Cell::new(width));
+    let pw_height = Rc::new(Cell::new(height));
+    let w_clone = pw_width.clone();
+    let h_clone = pw_height.clone();
 
+    
     let stream = pw::stream::StreamBox::new(&core, "capture", properties! {
         *pw::keys::MEDIA_TYPE     => "Video",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -192,30 +209,38 @@ fn run_pipewire(
     let _listener = stream
         .add_local_listener::<()>()
         .param_changed(move |_stream, _data, id, param| {
-        if id != pw::spa::sys::SPA_PARAM_EnumFormat && id != pw::spa::sys::SPA_PARAM_Format {
-            return;
-        }
+            if id != pw::spa::sys::SPA_PARAM_EnumFormat && id != pw::spa::sys::SPA_PARAM_Format {
+                return;
+            }
 
-        let param = match param {
-            Some(p) => p,
-            None => return,
-        };
+            let param = match param {
+                Some(p) => p,
+                None => return,
+            };
 
-        // 🔥 Главное исправление
-        let obj = match param.as_object() {
-            Ok(o) => o,
-            Err(_) => return,
-        };
+            let obj = match param.as_object() {
+                Ok(o) => o,
+                Err(_) => return,
+            };
 
-        if let Some(prop) = obj.find_prop(Id(pw::spa::sys::SPA_FORMAT_VIDEO_modifier)) {
-            let val = prop.value();
-
-            if val.is_long() {
-                if let Ok(m) = val.get_long() {
-                    log::info!("[PipeWire] modifier: {:#x}", m);
-                    modifier_for_param.store(m as u64, Ordering::SeqCst);
+            if let Some(prop) = obj.find_prop(Id(pw::spa::sys::SPA_FORMAT_VIDEO_size)) {
+                // Используем .get_rectangle(), который возвращает Result
+                if let Ok(rect) = prop.value().get_rectangle() {
+                    w_clone.set(rect.width);
+                    h_clone.set(rect.height);
+                    log::debug!("[PipeWire] Negotiated stream size: {}x{}", rect.width, rect.height);
                 }
             }
+
+            if let Some(prop) = obj.find_prop(Id(pw::spa::sys::SPA_FORMAT_VIDEO_modifier)) {
+                let val = prop.value();
+
+                if val.is_long() {
+                    if let Ok(m) = val.get_long() {
+                        log::info!("[PipeWire] modifier: {:#x}", m);
+                        modifier_for_param.store(m as u64, Ordering::SeqCst);
+                    }
+                }
         }
     })
         .process(move |stream, _| {
@@ -252,7 +277,8 @@ fn run_pipewire(
                 }
 
                 let enc = encoder.get_or_insert_with(|| {
-                    Encoder::new(width, height, sink.clone())
+                    log::info!("[ENCODER] Init with width {:?}, height {:?}", pw_width.get(), pw_height.get(),);
+                    Encoder::new(pw_width.get(), pw_height.get(), sink.clone())
                 });
 
                 match data.type_ {

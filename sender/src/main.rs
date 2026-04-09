@@ -53,7 +53,7 @@ async fn main() {
     // Swap it for `WindowsSender` or `AndroidSender` on other platforms without
     // touching any other code.
 
-    let sender = LinuxPipeWireSender::new(1920, 1080);
+    let sender = LinuxPipeWireSender::new(1, 1);
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

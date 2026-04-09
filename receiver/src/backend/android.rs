@@ -227,13 +227,13 @@ impl VideoBackend for AndroidMediaCodecBackend {
                     .find(|(id, _)| id.saturating_mul(16_667) == pts)
                     .map(|(id, t)| (*id, *t));
 
-                let should_drop = self.traces
+                let mut should_drop = self.traces
                     .iter()
                     .find(|(id, _)| id.saturating_mul(16_667) == pts)
                     .map(|(_, trace)| {
                         let now_us = FrameTrace::now_us() as i64;
                         let latency_ms = (now_us - trace.decode_us as i64) as f64 / 1000.0;
-                        latency_ms > 33.0
+                        latency_ms > 100.0
                     })
                     .unwrap_or(false);
                 
@@ -243,9 +243,10 @@ impl VideoBackend for AndroidMediaCodecBackend {
                 {
                     self.traces.pop_front();
                 }
+
                 if should_drop {
                     ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, false);
-                    Ok(FrameOutput::Pending)
+                    Ok(FrameOutput::Dropped)
                 } else {
                     self.last_rendered = found;
                     ndk_sys::AMediaCodec_releaseOutputBuffer(state.codec, idx as usize, true);

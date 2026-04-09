@@ -120,7 +120,7 @@ pub async fn run_quic_receiver<B: VideoBackend>(
     backend:     Arc<Mutex<B>>,
     sender_addr: SocketAddr,
     frame_tx: Option<mpsc::Sender<DecodedFrame>>,
-    mut trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
+    trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
 ) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
 
@@ -193,8 +193,21 @@ pub async fn run_quic_receiver<B: VideoBackend>(
                 continue;
             }
         };
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPacket>(100);
+
+        tokio::spawn(async move {
+            while let Some(packet) = control_rx.recv().await {
+                if let Ok(bytes) = postcard::to_stdvec(&packet) {
+                    let len = (bytes.len() as u32).to_le_bytes();
+                    if uni_send.write_all(&len).await.is_err() { break; }
+                    if uni_send.write_all(&bytes).await.is_err() { break; }
+                }
+            }
+            log::debug!("[QUIC] Control stream task exited");
+        });
 
         let trace_rx_clone = trace_rx.clone();
+        let control_tx_for_trace = control_tx.clone();
         tokio::spawn(async move {
             // Таймер: раз в 1 секунду (можешь поменять на 2 или 0.5)
             let mut interval = tokio::time::interval(Duration::from_millis(1500));
@@ -212,19 +225,15 @@ pub async fn run_quic_receiver<B: VideoBackend>(
                         last_sent_id = frame_id;
 
                         let packet = ControlPacket::FrameFeedback { frame_id, trace };
-                        if let Ok(bytes) = postcard::to_stdvec(&packet) {
-                            let len = (bytes.len() as u32).to_le_bytes();
-                            
-                            // Пишем в стрим длину и тело.
-                            // Если вернулась ошибка - стрим/коннект умер, выходим из лупа.
-                            if uni_send.write_all(&len).await.is_err() { break; }
-                            if uni_send.write_all(&bytes).await.is_err() { break; }
+                        if control_tx_for_trace.send(packet).await.is_err() {
+                            break;
                         }
                     }
                 }
             }
             log::debug!("[QUIC] Feedback stream loop exited");
         });
+
 
         let ping_conn = conn.clone();
         tokio::spawn(async move {
@@ -244,7 +253,7 @@ pub async fn run_quic_receiver<B: VideoBackend>(
                 tokio::time::sleep(delay).await;
             }
         });
-        receive_datagrams(conn, backend.clone(), frame_tx.clone()).await;
+        receive_datagrams(conn, backend.clone(), frame_tx.clone(), control_tx.clone()).await;
         log::warn!("[QUIC] Connection lost, reconnecting in 2 s...");
         tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -284,7 +293,8 @@ pub async fn send_offset_update(conn: &quinn::Connection, rtt_us: u64) -> Result
 async fn receive_datagrams<B: VideoBackend>(
     conn:     quinn::Connection,
     backend:  Arc<Mutex<B>>,
-    frame_tx: Option<mpsc::Sender<DecodedFrame>>
+    frame_tx: Option<mpsc::Sender<DecodedFrame>>,
+    control_tx: mpsc::Sender<ControlPacket>,
 ) {
     let mut video_state = VideoState {
         reassembly: HashMap::new(),
@@ -312,7 +322,7 @@ async fn receive_datagrams<B: VideoBackend>(
 
         match chunk.packet_type {
             TYPE_VIDEO => {
-                handle_video_chunk(chunk, &mut video_state, &backend, &frame_tx).await;
+                handle_video_chunk(chunk, &mut video_state, &backend, &frame_tx, &control_tx).await;
             }
             TYPE_AUDIO => {
                 // Аудио не ждет сборки видео! Пролетает сразу.
@@ -449,6 +459,7 @@ async fn handle_video_chunk<B: VideoBackend>(
     state: &mut VideoState,
     backend: &Arc<Mutex<B>>,
     frame_tx: &Option<mpsc::Sender<DecodedFrame>>,
+    control_tx: &mpsc::Sender<ControlPacket>,
 ) {
     let frame_id = chunk.frame_id;
     let is_key = chunk.flags & 1 != 0;
@@ -512,7 +523,14 @@ async fn handle_video_chunk<B: VideoBackend>(
         if backend_lock.push_encoded(&packet.payload, packet.frame_id, packet.trace.take()).is_ok() {
             loop {
                 match backend_lock.poll_output() {
-                    Ok(FrameOutput::Pending) => break,  // декодер ещё не готов — выходим
+                    Ok(FrameOutput::Pending) => break, //Decoder not ready
+                    Ok(FrameOutput::Dropped) => {
+                        let msg = ControlPacket::Communication { 
+                            message: format!("DROP#{}", packet.frame_id) 
+                        };
+                        let _ = control_tx.try_send(msg);
+                        continue;
+                    },  //Decoder dropped a frame
                     Ok(frame) => decoded_frames.push(frame),
                     Err(_) => break,
                 }
