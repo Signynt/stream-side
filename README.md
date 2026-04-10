@@ -1,5 +1,9 @@
 HOW TO USE AND BUILD:
 
+If you downloaded the binary use it from the terminal like this:
+./sender (optional: <listn_addr>)
+./receiver <addr_to_connect_to>:**4433**
+
 In the streamcapture folder:
 Run sender (only linux pipewire as of now) = 
 1) cargo run --release (accepts all connections to port 4433)
