@@ -11,7 +11,7 @@ use common::{FrameTrace, VideoPacket};
 pub mod backend;
 pub mod network;
 pub mod types;
-
+pub mod platform;
 // Android-инициализация логгера выполняется при загрузке библиотеки
 #[cfg(target_os = "android")]
 #[allow(non_snake_case)]
@@ -31,12 +31,15 @@ pub extern "C" fn JNI_OnLoad(
     jni::sys::JNI_VERSION_1_6
 }
 
-pub const JITTER_TARGET_MS: u64 = 48;
+pub const JITTER_TARGET_MS: u64 = 5;
  
 /// Maximum number of frames held simultaneously.  When exceeded the oldest
 /// frame is evicted (dropped) to bound memory use.
 pub const JITTER_MAX_FRAMES: usize = 16;
  
+ pub enum UserEvent {
+    NewFrame,
+}
 // ─────────────────────────────────────────────────────────────────────────────
 // Jitter buffer
 // ─────────────────────────────────────────────────────────────────────────────

@@ -25,6 +25,7 @@
 use std::os::unix::io::RawFd;
 use std::{ffi::CString, ptr, slice, sync::Arc};
 
+use bytes::Bytes;
 use ffmpeg_next::{self as ffmpeg, Frame};
 use ffmpeg::{codec, format::Pixel, software::scaling, util::frame::video::Video};
 use ffmpeg_next::ffi::*;
@@ -48,7 +49,7 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID — драйвер сам определяет модификатор по GEM-хэндлу.
 /// Используется как fallback, когда реальный модификатор неизвестен.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-const BITRATE: i64 = 2_000_000;
+const BITRATE: i64 = 5_000_000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Тип кадра, передаваемого в канал энкодера
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,7 +153,8 @@ impl Encoder {
 }
 
 pub struct EncodedFrame {
-    pub payload: Vec<u8>,
+    pub frame_id: u64,
+    pub slices: Vec<Bytes>,
     pub is_key:  bool,
     pub trace:   Option<FrameTrace>,
 }
@@ -268,12 +270,16 @@ fn run_encoder_loop(
         (*raw).max_b_frames   = 0;
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
+        (*raw).slices       = 4;
     }
 
     let mut opts = ffmpeg::Dictionary::new();
     opts.set("async_depth",   "1");
     opts.set("low_delay_brc", "1");
-
+    opts.set("intra_refresh", "1");
+    opts.set("intra_refresh_type", "both");
+    opts.set("mbtree", "0"); 
+    opts.set("tune", "zerolatency");
     // VAAPI + DRM: создаём оба контекста через единый DRM-девайс.
     // ВАЖНО: VAAPI должен быть ПРОИЗВОДНЫМ от DRM-девайса, чтобы оба контекста
     // разделяли один и тот же fd DRM-устройства. Только тогда av_hwframe_transfer_data
@@ -281,31 +287,31 @@ fn run_encoder_loop(
     let (hw_enc_ref, hw_import_ref, drm_frames_ref, mut vaapi_convert_graph) =
         unsafe { init_hw_contexts(enc_ctx.as_mut_ptr(), width, height) };
 
-    unsafe {
-        dump_transfer_formats(
-            "DRM FROM",
-            drm_frames_ref,
-            AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
-        );
+    // unsafe {
+    //     dump_transfer_formats(
+    //         "DRM FROM",
+    //         drm_frames_ref,
+    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
+    //     );
 
-        dump_transfer_formats(
-            "VAAPI TO",
-            hw_enc_ref,
-            AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-        );
+    //     dump_transfer_formats(
+    //         "VAAPI TO",
+    //         hw_enc_ref,
+    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
+    //     );
 
-        dump_transfer_formats(
-            "IMPORTED BGRA",
-            hw_import_ref,
-            AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-        );
-    }
+    //     dump_transfer_formats(
+    //         "IMPORTED BGRA",
+    //         hw_import_ref,
+    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
+    //     );
+    // }
 
     if drm_frames_ref.is_null() {
-        log::warn!("[Encoder] DRM hw_frames_ctx недоступен — DMA-BUF путь отключён, \
-                    кадры SPA_DATA_DmaBuf будут дропаться.");
+        log::warn!("[Encoder] DRM hw_frames_ctx not available — DMA-BUF disabled. \
+                    SPA_DATA_DmaBuf frames will be dropped.");
     } else {
-        log::info!("[Encoder] DMA-BUF zero-copy путь активирован.");
+        log::info!("[Encoder] DMA-BUF zero-copy.");
     }
 
     let mut encoder = enc_ctx
@@ -423,14 +429,61 @@ fn run_encoder_loop(
                         let is_key = pkt.is_key();
 
                         if !started {
-                            if !is_key { continue; }
+                            if !is_key { 
+                                log::info!("[ENCODER] The frame is not a KeyFrame, continuing!");
+                                continue; 
+                            }
                             started = true;
                             log::info!("[Encoder] First IDR frame produced");
                         }
 
                         if let Some(data) = pkt.data() {
+                            // ── NALU slicing ────────────────────────────────────
+                            let full_data = Bytes::copy_from_slice(data);
+
+                            let mut boundaries: Vec<usize> = Vec::new();
+                            let mut pos = 0usize;
+                            while pos + 3 <= data.len() {
+                                if pos + 3 < data.len()
+                                    && data[pos]   == 0
+                                    && data[pos+1] == 0
+                                    && data[pos+2] == 0
+                                    && data[pos+3] == 1
+                                {
+                                    boundaries.push(pos);
+                                    pos += 4;
+                                } else if data[pos] == 0 && data[pos+1] == 0 && data[pos+2] == 1 {
+                                    boundaries.push(pos);
+                                    pos += 3;
+                                } else {
+                                    pos += 1;
+                                }
+                            }
+                            const MAX_SLICES: usize = u8::MAX as usize;
+                            let effective = if boundaries.len() > MAX_SLICES {
+                                log::warn!(
+                                    "[Encoder] frame has {} NALUs, clamping to {MAX_SLICES}",
+                                    boundaries.len()
+                                );
+                                &boundaries[..MAX_SLICES]
+                            } else {
+                                &boundaries[..]
+                            };
+
+                            let mut slices: Vec<Bytes> = Vec::with_capacity(effective.len().max(1));
+                            let ends = effective.iter().skip(1).copied().chain(std::iter::once(data.len()));
+                            for (&start, end) in effective.iter().zip(ends) {
+                                slices.push(full_data.slice(start..end));
+                            }
+ 
+                            // Fallback: if no start codes were found, treat the whole packet
+                            // as a single NALU (e.g. raw bytestream without Annex-B prefix).
+                            if slices.is_empty() && !data.is_empty() {
+                                slices.push(full_data.clone());
+                            }
                             match sink.try_send(EncodedFrame {
-                                payload: data.to_vec(),
+                                frame_id: 0,
+                                slices,
                                 is_key,
                                 trace: Some(trace),
                             }) {

@@ -60,7 +60,7 @@ impl QuicServer {
 
         // broadcast capacity = 64 frames  (~1 second of 60 fps with headroom).
         // watch is not used here because we need `is_key` alongside the data.
-        let (bcast_tx, _) = broadcast::channel::<Arc<(u64, Bytes, bool)>>(64);
+        let (bcast_tx, _) = broadcast::channel::<Arc<EncodedFrame>>(64);
         let server_bcast  = bcast_tx.clone();
 
         // ── Serialiser task ──────────────────────────────────────────────────
@@ -69,14 +69,14 @@ impl QuicServer {
         tokio::spawn(async move {
             let mut frame_id = 0u64;
 
-            while let Some(EncodedFrame { payload, is_key, mut trace }) = frame_rx.recv().await {
+            while let Some(mut frame) = frame_rx.recv().await {
                 frame_id += 1;
+                frame.frame_id = frame_id;
 
-                if let Some(t) = trace.as_mut() {
-                    t.serialize_us = FrameTrace::now_us();
+                if let Some(t) = frame.trace.as_mut() {
+                    // t.serialize_us = FrameTrace::now_us(); 
                 }
-
-                let packet = VideoPacket { frame_id, payload, is_key, trace, };
+                let shared_frame = Arc::new(frame);
 
                 // log::info!(
                 //     "[SEND RAW] id={} size={} key={}",
@@ -85,16 +85,8 @@ impl QuicServer {
                 //     packet.is_key
                 // );
 
-                match postcard::to_allocvec(&packet) {
-                    Ok(bin) => {
-                        // Wrap in Arc so clients share the allocation without copying.
-                        let _ = server_bcast.send(Arc::new((
-                            frame_id,
-                            Bytes::from(bin),
-                            is_key,
-                        )));
-                    }
-                    Err(e) => log::error!("[QuicServer] serialise error: {e}"),
+                if let Err(_) = server_bcast.send(shared_frame) {
+                    // Если нет активных подписчиков, broadcast вернет ошибку, это нормально
                 }
             }
         });
@@ -114,7 +106,7 @@ impl QuicServer {
                             let identity_tx_for_accept = identity_tx.clone();
 
                             let idr_tx_conn = idr_tx_init.clone();
-
+                            let ird_tx_loop = idr_tx_init.clone();
                             let info = Arc::new(ConnectionInfo {
                                 remote: conn.remote_address().to_string(),
                                 label: RwLock::new(conn.remote_address().to_string()),
@@ -169,8 +161,7 @@ impl QuicServer {
                                     }
                                 }
                             });
-                            
-                            send_loop_to_client(conn, client_rx, info_main, &clock_off_main).await;
+                            send_loop_to_client(conn, client_rx, info_main, &clock_off_main, ird_tx_loop).await;
                         }
                         Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),
                     }
@@ -212,9 +203,10 @@ impl QuicServer {
 
 async fn send_loop_to_client(
     conn: quinn::Connection,
-    mut video_rx: broadcast::Receiver<Arc<(u64, Bytes, bool)>>,
+    mut video_rx: broadcast::Receiver<Arc<EncodedFrame>>,
     info: Arc<ConnectionInfo>,
-    clock_offset: &AtomicI64
+    clock_offset: &AtomicI64,
+    idr_tx: watch::Sender<bool>,
 ) {
     let mut started = false;
     let remote = conn.remote_address();
@@ -223,51 +215,57 @@ async fn send_loop_to_client(
     let max_dgram = conn.max_datagram_size().unwrap_or(1200);
     let max_chunk_data = max_dgram.saturating_sub(DatagramChunk::HEADER_LEN + 8);
 
-    let mut pacer = FramePacer::new(50.0, 4.0);
+    let mut pacer = FramePacer::new(100.0, 4.0);
     loop {
         tokio::select! {
             // 1. ОТПРАВКА ВИДЕО
-            
             video_result = video_rx.recv() => {
                 match video_result {
-                    Ok(msg) => {
+                    Ok(frame) => { // frame — это Arc<EncodedFrame>
                         if !info.ready.load(Ordering::Acquire) {
                             continue;
                         }
-                        let (frame_id, ref data, is_key) = *msg;
+
                         if !started {
-                            if !is_key { continue; }
+                            if !frame.is_key { continue; }
                             started = true;
                         }
                         
-                        let flags = if is_key { 1 } else { 0 };
-                        let total_chunks = ((data.len() + max_chunk_data - 1) / max_chunk_data) as u16;
+                        let flags = if frame.is_key { 1 } else { 0 };
+                        let total_slices = frame.slices.len() as u8;
 
-                        for (idx, offset) in (0..data.len()).step_by(max_chunk_data).enumerate() {
-                            let end   = (offset + max_chunk_data).min(data.len());
-                            let slice = data.slice(offset..end);
- 
-                            // ── Token-bucket pacing ──────────────────────────
-                            // Consume one chunk-worth of tokens.  If the bucket
-                            // is empty, sleep until it refills.  The sleep is
-                            // inside this select arm, so control datagrams
-                            // (Ping, etc.) are delayed by at most one inter-chunk
-                            // interval (≤ ~200 µs at 100 Mbit/s) — acceptable.
-                            let wait = pacer.consume(DatagramChunk::HEADER_LEN + slice.len());
-                            if !wait.is_zero() {
-                                tokio::time::sleep(wait).await;
-                            }
- 
-                            let dgram = DatagramChunk::encode(
-                                frame_id, idx as u16, total_chunks,
-                                TYPE_VIDEO, flags, &slice,
+                        // Теперь итерируемся по реальным слайсам из энкодера
+                        for (s_idx, slice_data) in frame.slices.iter().enumerate() {
+                            
+                            // FEC энкодер теперь работает с отдельным NALU
+                            let chunks = common::fec::FecEncoder::encode_slice(
+                                frame.frame_id,
+                                s_idx as u8,
+                                total_slices,
+                                slice_data, // Это Bytes, передается эффективно
+                                max_chunk_data,
+                                flags
                             );
-                            if conn.send_datagram(dgram).is_err() { break; }
+
+                            for chunk in chunks {
+                                // Pacer считает нагрузку на сеть
+                                let wait = pacer.consume(DatagramChunk::HEADER_LEN + chunk.data.len());
+                                if !wait.is_zero() {
+                                    tokio::time::sleep(wait).await;
+                                }
+
+                                // Отправляем чанк в QUIC
+                                let dgram = chunk.to_bytes();
+                                if conn.send_datagram(dgram.into()).is_err() {
+                                    log::error!("[QUIC] Failed to send datagram to {remote}");
+                                    return; 
+                                }
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         log::warn!("[QUIC] Client {remote} lagged {n} frames, resetting to next IDR");
-                        started = false;  // ← сброс, ждём IDR
+                        started = false; 
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -275,13 +273,15 @@ async fn send_loop_to_client(
             }
 
             // 2. ПРИЕМ КОМАНД ОТ КЛИЕНТА (Ping, RequestKeyFrame, и т.д.)
+            
             incoming = conn.read_datagram() => {
                 match incoming {
                     Ok(raw_data) => {
                         // Декодируем как наш чанк (клиент тоже шлет в этом формате)
                         if let Some(chunk) = DatagramChunk::decode(raw_data) {
+                            let idr_clone = idr_tx.clone();
                             if chunk.packet_type == TYPE_CONTROL {
-                                handle_control(&conn, chunk.data, &info, clock_offset).await;
+                                handle_control(&conn, chunk.data, &info, clock_offset, idr_clone).await;
                             }
                         }
                     }
@@ -291,10 +291,12 @@ async fn send_loop_to_client(
                     }
                 }
             }
+        }
+        
             
             // 3. (В БУДУЩЕМ) ОТПРАВКА АУДИО
             // Ok(audio_msg) = audio_rx.recv() => { ... }
-        }
+        
     }
 }
 
@@ -422,7 +424,7 @@ fn client_to_server_us(t: u64, clock_offset: &AtomicI64) -> u64 {
     }
 }
 
-async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &ConnectionInfo, clock_offset: &AtomicI64) {
+async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &ConnectionInfo, clock_offset: &AtomicI64, idr_tx: watch::Sender<bool>,) {
     if let Ok(packet) = postcard::from_bytes::<ControlPacket>(&data) {
         match packet {
             ControlPacket::Ping { client_time_us } => {
@@ -432,7 +434,18 @@ async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &Connection
                 };
                 if let Ok(bin) = postcard::to_stdvec(&pong) {
                     // Отправляем ответ как TYPE_CONTROL
-                    let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bin);
+                    let dgram = DatagramChunk::encode(
+                        0,                  // frame_id (для контроля можно 0)
+                        0,                  // slice_idx
+                        1,                  // total_slices
+                        0,                  // shard_idx
+                        1,                  // k
+                        0,                  // m
+                        bin.len() as u16,   // payload_len
+                        TYPE_CONTROL,       // packet_type
+                        0,                  // flags
+                        &bin                // data
+                    );
                     let _ = conn.send_datagram(dgram);
                 }
             },
@@ -440,6 +453,41 @@ async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &Connection
             ControlPacket::OffsetUpdate { offset_us, rtt_us } => {
                 clock_offset.store(offset_us, Ordering::Relaxed);
                 log::info!("[{}] RTT: {:.1}ms", info.label().await, rtt_us as f64 / 1000.0);
+            }
+            ControlPacket::FrameFeedback { frame_id, trace } => {
+                let t = trace;
+                let label = info.label().await;
+
+                let receive_srv     = client_to_server_us(t.receive_us, &clock_offset);
+                let reassembled_srv = client_to_server_us(t.reassembled_us, &clock_offset);
+                let decode_srv      = client_to_server_us(t.decode_us, &clock_offset);
+                let present_srv     = client_to_server_us(t.present_us, &clock_offset);
+                let off = clock_offset.load(Ordering::Relaxed);
+
+                log::info!(
+                    "[QUIC] {label} got frame trace. Offset is: {off}:
+                    #{frame_id}: capture→encode={:.1}ms encode→serial={:.1}ms \
+                    serial→recv={:.1}ms recv→reassem={:.1}ms reassem→decode={:.1}ms \
+                    decode→present={:.1}ms  TOTAL={:.1}ms",
+                    FrameTrace::ms(t.capture_us, t.encode_us),
+                    FrameTrace::ms(t.encode_us, t.serialize_us),
+                    FrameTrace::ms(t.serialize_us, receive_srv),
+                    FrameTrace::ms(receive_srv, reassembled_srv),
+                    FrameTrace::ms(reassembled_srv, decode_srv),
+                    FrameTrace::ms(decode_srv, present_srv),
+                    FrameTrace::ms(t.capture_us, present_srv),
+                );
+            }
+            ControlPacket::Communication { message } => {
+                let label = info.label().await;
+                log::info!("[QUIC] {label} send a MESSAGE: {message}");
+            }
+
+            ControlPacket::RequestKeyFrame => {
+                let label = info.label().await;
+                log::info!("[QUIC] Client {label} requested KeyFrame!");
+                let _ = idr_tx.send(true);
+                let _ = idr_tx.send(false);
             }
             _ => ()
         }
@@ -477,14 +525,14 @@ fn build_server_endpoint(addr: SocketAddr) -> Endpoint {
     // Datagram buffers — 16 MB handles burst of ~80 uncompressed HEVC frames
     // before the kernel starts dropping.
     t.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
-    t.datagram_send_buffer_size(16 * 1024 * 1024);
+    t.datagram_send_buffer_size(8 * 1024 * 1024);
     t.send_fairness(true);
     // Initial MTU probe value for Ethernet LAN.
     //
     // Path MTU = 1500 (Ethernet) - 20 (IP) - 8 (UDP) - ~20 (QUIC) = ~1452.
     // We probe at 1400 to stay safe across VPN tunnels and 802.11 frames.
     // Quinn will discover the actual maximum via PMTUD automatically.
-    t.initial_mtu(1400);
+    t.initial_mtu(1200);
 
     // Keep-alive: prevents NAT table expiry and detects dead connections within
     // ~1.5 × keep_alive_interval, long before `max_idle_timeout` fires.

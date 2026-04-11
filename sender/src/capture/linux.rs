@@ -210,6 +210,12 @@ fn run_pipewire(
 
     let _listener = stream
         .add_local_listener::<()>()
+        .state_changed(|stream, _user_data, old, new| { 
+        log::info!(
+            "[PipeWire] Stream state changed: {:?} -> {:?}", 
+            old, new
+            );
+        })
         .param_changed(move |_stream, _data, id, param| {
             if id != pw::spa::sys::SPA_PARAM_EnumFormat && id != pw::spa::sys::SPA_PARAM_Format {
                 return;
@@ -387,11 +393,11 @@ fn build_spa_video_params() -> Vec<u8> {
             // МАГИЯ ЗДЕСЬ: Сообщаем Hyprland/PipeWire, что мы умеем читать видеопамять (DMA-BUF)
             // Мы запрашиваем линейный формат памяти (0 = DRM_FORMAT_MOD_LINEAR),
             // который нужен нашему энкодеру в encode.rs
-            pw::spa::pod::Property {
-                key:   SPA_FORMAT_VIDEO_modifier,
-                flags: PropertyFlags::MANDATORY,
-                value: pw::spa::pod::Value::Long(0), 
-            },
+            // pw::spa::pod::Property {
+            //     key:   SPA_FORMAT_VIDEO_modifier,
+            //     flags: PropertyFlags::empty(),
+            //     value: pw::spa::pod::Value::Long(0), 
+            // },
         ],
     });
 
@@ -413,7 +419,11 @@ fn build_spa_buffer_params() -> Vec<u8> {
                 key:   SPA_PARAM_BUFFERS_dataType,
                 flags: PropertyFlags::empty(),
                 // Устанавливаем битовую маску, разрешающую ТОЛЬКО DmaBuf
-                value: pw::spa::pod::Value::Int(1 << (SPA_DATA_DmaBuf as i32)),
+                value: pw::spa::pod::Value::Int(
+                    (1 << (SPA_DATA_DmaBuf as i32)) | 
+                    (1 << (SPA_DATA_MemPtr as i32)) |
+                    (1 << (SPA_DATA_MemFd as i32))
+                ),
             },
         ],
     });
