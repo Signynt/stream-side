@@ -894,6 +894,13 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::NewFrame => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(decoded) = self.poll_latest_frame() {
             if let Some(state) = self.state.as_mut() {
@@ -976,15 +983,22 @@ impl ApplicationHandler<UserEvent> for App {
                         
                         let (frame_id, frame_trace) = match &decoded {
                             DecodedFrame::Yuv(f) => (f.frame_id, f.trace),
-                            #[cfg(unix)]
+                            #[cfg(target_os = "linux")]
+                            DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+                            #[cfg(not(target_os = "linux"))]
                             DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
                         };
 
                         match decoded {
                             DecodedFrame::Yuv(frame) => state.update_textures_cpu(&frame),
-                            #[cfg(unix)]
+                            #[cfg(target_os = "linux")]
                             DecodedFrame::DmaBuf(frame) => {
                                 if !state.update_textures_dmabuf(&frame) { return; }
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            DecodedFrame::DmaBuf(_frame) => {
+                                log::warn!("[Render] DMA-BUF frame received on non-Linux build");
+                                return;
                             }
                         }
 
