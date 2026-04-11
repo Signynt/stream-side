@@ -53,6 +53,7 @@ use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 use std::ptr;
+use std::path::Path;
 
 use common::FrameTrace;
 
@@ -144,9 +145,23 @@ impl DesktopFfmpegBackend {
         // чтобы DMA-BUF экспортированный FFmpeg мог быть импортирован
         // Vulkan без EINVAL.
 
-        let (vaapi_dev, drm_dev, dmabuf_enabled) = unsafe {
+        let (vaapi_dev, drm_dev, mut dmabuf_enabled) = unsafe {
             init_vaapi_from_drm(ctx.as_mut_ptr())
         };
+
+        // NVIDIA + Vulkan DMA-BUF import can produce chroma artifacts on some stacks.
+        // Default to CPU fallback there; allow override with RECEIVER_FORCE_DMABUF=1.
+        let force_dmabuf = std::env::var("RECEIVER_FORCE_DMABUF").ok().as_deref() == Some("1");
+        let disable_dmabuf = std::env::var("RECEIVER_DISABLE_DMABUF").ok().as_deref() == Some("1");
+        let nvidia_present = Path::new("/proc/driver/nvidia/version").exists();
+
+        if disable_dmabuf {
+            dmabuf_enabled = false;
+            log::info!("[Decoder] DMA-BUF path disabled by RECEIVER_DISABLE_DMABUF=1");
+        } else if nvidia_present && !force_dmabuf {
+            dmabuf_enabled = false;
+            log::info!("[Decoder] NVIDIA detected: disabling DMA-BUF export/import path (CPU fallback)");
+        }
 
         unsafe {
             if !vaapi_dev.is_null() {
@@ -294,7 +309,7 @@ impl VideoBackend for DesktopFfmpegBackend {
 
         // ── 4. CPU-путь (fallback): VAAPI → NV12 CPU ─────────────────────────
 
-        let frame_ptr: *const AVFrame = if fmt == Pixel::VAAPI {
+        let (frame_ptr, frame_fmt): (*const AVFrame, Pixel) = if fmt == Pixel::VAAPI {
             unsafe {
                 av_frame_unref(self.transfer_frame);
                 (*self.transfer_frame).format = AVPixelFormat::AV_PIX_FMT_NV12 as i32;
@@ -310,29 +325,29 @@ impl VideoBackend for DesktopFfmpegBackend {
                     ));
                 }
                 av_frame_copy_props(self.transfer_frame, raw.as_ptr());
-                self.transfer_frame as *const AVFrame
+                (self.transfer_frame as *const AVFrame, Pixel::NV12)
             }
         } else {
-            unsafe { raw.as_ptr() }
+            (unsafe { raw.as_ptr() }, fmt)
         };
 
         // ── 5. SW fallback: конвертируем в NV12 если нужно ───────────────────
 
-        let nv12_ptr: *const AVFrame = if fmt == Pixel::NV12 {
+        let nv12_ptr: *const AVFrame = if frame_fmt == Pixel::NV12 {
             frame_ptr
         } else {
-            if fmt != self.last_fmt {
-                self.last_fmt = fmt;
+            if frame_fmt != self.last_fmt {
+                self.last_fmt = frame_fmt;
                 self.scaler = Some(
                     scaling::Context::get(
-                        fmt, w, h,
+                        frame_fmt, w, h,
                         Pixel::NV12, w, h,
                         scaling::Flags::BILINEAR,
                     )
                     .map_err(|e| BackendError::DecodeError(e.to_string()))?,
                 );
                 self.scaler_out = Some(Video::new(Pixel::NV12, w, h));
-                log::debug!("[Decoder] Scaler created: {:?} → NV12 {}×{}", fmt, w, h);
+                log::debug!("[Decoder] Scaler created: {:?} → NV12 {}×{}", frame_fmt, w, h);
             }
 
             let sc  = self.scaler.as_mut().unwrap();

@@ -23,7 +23,7 @@
 //! | vaapi-encoder  | приём `FrameData`, кодирование, отправка NAL в sink  |
 
 use std::os::unix::io::RawFd;
-use std::{ffi::CString, ptr, slice, sync::Arc};
+use std::{ffi::CString, path::Path, ptr, slice, sync::Arc};
 
 use bytes::Bytes;
 use ffmpeg_next::{self as ffmpeg, Frame};
@@ -60,7 +60,10 @@ pub enum FrameData {
     ///
     /// Буфер взят из пула двойной буферизации и должен быть возвращён
     /// через `free_tx` после использования.
-    Bgra(Vec<u8>),
+    Bgra {
+        data: Vec<u8>,
+        stride: u32,
+    },
 
     /// DMA-BUF кадр — нулевое копирование на CPU.
     ///
@@ -125,10 +128,15 @@ impl Encoder {
     ///
     /// Если пул буферов пуст (энкодер не успевает) — кадр молча дропается.
     pub fn encode_bgra(&self, frame: &[u8], capture_us: u64) {
+        self.encode_bgra_with_stride(frame, 0, capture_us);
+    }
+
+    /// Отправить BGRA-кадр с явным stride (bytes per row) на кодирование.
+    pub fn encode_bgra_with_stride(&self, frame: &[u8], stride: u32, capture_us: u64) {
         if let Ok(mut buf) = self.free_rx.try_recv() {
             let len = frame.len().min(buf.len());
             buf[..len].copy_from_slice(&frame[..len]);
-            let _ = self.tx.try_send((FrameData::Bgra(buf), capture_us));
+            let _ = self.tx.try_send((FrameData::Bgra { data: buf, stride }, capture_us));
         }
     }
 
@@ -253,8 +261,31 @@ fn run_encoder_loop(
 ) {
     // ── Инициализация кодека ─────────────────────────────────────────────────
 
-    let codec = codec::encoder::find_by_name("hevc_vaapi")
-        .expect("hevc_vaapi encoder not found; ensure VA-API is available");
+    // Try NVENC on NVIDIA systems, otherwise keep VAAPI default behavior.
+    let mut use_nvenc = false;
+    let nvidia_present = Path::new("/proc/driver/nvidia/version").exists();
+    let codec = if nvidia_present {
+        if let Some(nvenc) = codec::encoder::find_by_name("hevc_nvenc") {
+            log::info!("[Encoder] Using NVIDIA NVENC (hevc_nvenc)");
+            use_nvenc = true;
+            nvenc
+        } else if let Some(vaapi) = codec::encoder::find_by_name("hevc_vaapi") {
+            log::info!("[Encoder] NVIDIA detected, NVENC unavailable; falling back to VAAPI (hevc_vaapi)");
+            vaapi
+        } else {
+            panic!("No supported hardware encoder found: neither hevc_nvenc nor hevc_vaapi available");
+        }
+    } else if let Some(vaapi) = codec::encoder::find_by_name("hevc_vaapi") {
+        log::info!("[Encoder] Using VAAPI (hevc_vaapi)");
+        vaapi
+    } else if let Some(nvenc) = codec::encoder::find_by_name("hevc_nvenc") {
+        // Keep a last-resort fallback to NVENC if available.
+        log::info!("[Encoder] Using NVIDIA NVENC (hevc_nvenc)");
+        use_nvenc = true;
+        nvenc
+    } else {
+        panic!("No supported hardware encoder found: neither hevc_nvenc nor hevc_vaapi available");
+    };
 
     let mut enc_ctx = codec::context::Context::new_with_codec(codec);
 
@@ -263,55 +294,74 @@ fn run_encoder_loop(
         (*raw).width          = width  as i32;
         (*raw).height         = height as i32;
         (*raw).time_base      = AVRational { num: 1, den: 60 };
-        (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_VAAPI;
+        if use_nvenc {
+            (*raw).pix_fmt = AVPixelFormat::AV_PIX_FMT_NV12;
+        } else {
+            (*raw).pix_fmt = AVPixelFormat::AV_PIX_FMT_VAAPI;
+            (*raw).slices  = 4;
+        }
         (*raw).bit_rate       = BITRATE;
         (*raw).rc_max_rate    = BITRATE;
         (*raw).rc_buffer_size = BITRATE as i32 / 2;
         (*raw).max_b_frames   = 0;
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
-        (*raw).slices       = 4;
     }
 
     let mut opts = ffmpeg::Dictionary::new();
+    if use_nvenc {
+        opts.set("preset", "p3");
+        opts.set("rc", "vbr");
+        opts.set("profile", "main");
+        opts.set("gpu", "0");
+        // NVENC does not use VAAPI/DRM contexts
+    } else {
     opts.set("async_depth",   "1");
     opts.set("low_delay_brc", "1");
-    opts.set("intra_refresh", "1");
-    opts.set("intra_refresh_type", "both");
-    opts.set("mbtree", "0"); 
-    opts.set("tune", "zerolatency");
+        opts.set("intra_refresh", "1");
+        opts.set("intra_refresh_type", "both");
+        opts.set("mbtree", "0");
+        opts.set("tune", "zerolatency");
+    }
+
     // VAAPI + DRM: создаём оба контекста через единый DRM-девайс.
     // ВАЖНО: VAAPI должен быть ПРОИЗВОДНЫМ от DRM-девайса, чтобы оба контекста
     // разделяли один и тот же fd DRM-устройства. Только тогда av_hwframe_transfer_data
     // (DRM_PRIME → VAAPI) сможет шарить DMA-BUF без EINVAL (-22).
     let (hw_enc_ref, hw_import_ref, drm_frames_ref, mut vaapi_convert_graph) =
-        unsafe { init_hw_contexts(enc_ctx.as_mut_ptr(), width, height) };
+        if use_nvenc {
+            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), None)
+        } else {
+            unsafe { init_hw_contexts(enc_ctx.as_mut_ptr(), width, height) }
+        };
 
-    // unsafe {
-    //     dump_transfer_formats(
-    //         "DRM FROM",
-    //         drm_frames_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
-    //     );
+    if !use_nvenc {
+        unsafe {
+            dump_transfer_formats(
+                "DRM FROM",
+                drm_frames_ref,
+                AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
+            );
 
-    //     dump_transfer_formats(
-    //         "VAAPI TO",
-    //         hw_enc_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-    //     );
+            dump_transfer_formats(
+                "VAAPI TO",
+                hw_enc_ref,
+                AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
+            );
 
-    //     dump_transfer_formats(
-    //         "IMPORTED BGRA",
-    //         hw_import_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-    //     );
-    // }
+            dump_transfer_formats(
+                "IMPORTED BGRA",
+                hw_import_ref,
+                AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
+            );
+        }
 
-    if drm_frames_ref.is_null() {
-        log::warn!("[Encoder] DRM hw_frames_ctx not available — DMA-BUF disabled. \
-                    SPA_DATA_DmaBuf frames will be dropped.");
-    } else {
-        log::info!("[Encoder] DMA-BUF zero-copy.");
+        if drm_frames_ref.is_null() {
+            log::warn!("[Encoder] DRM hw_frames_ctx not available — DMA-BUF disabled. \
+                        SPA_DATA_DmaBuf frames will be dropped.");
+        } else {
+            log::info!("[Encoder] DMA-BUF zero-copy.");
+        }
     }
 
     let mut encoder = enc_ctx
@@ -353,7 +403,7 @@ fn run_encoder_loop(
         // Дренируем канал: берём самый свежий кадр.
         while let Ok(newer) = rx.try_recv() {
             match frame_data {
-                FrameData::Bgra(buf) => { let _ = free_tx.send(buf); }
+                FrameData::Bgra { data: buf, .. } => { let _ = free_tx.send(buf); }
                 FrameData::DmaBuf { fd, .. } => unsafe { libc::close(fd); },
             }
             frame_data  = newer.0;
@@ -366,19 +416,64 @@ fn run_encoder_loop(
             }
         }
 
-        // Получаем VAAPI hw_frame в зависимости от типа входа.
-        let hw_frame_opt: Option<*mut AVFrame> = unsafe {
+        // Получаем VAAPI frame в зависимости от типа входа.
+        let frame_opt: Option<*mut AVFrame> = unsafe {
             match frame_data {
-                FrameData::Bgra(ref bgra) => {
+                FrameData::Bgra { data: ref bgra, stride } => {
+                    if use_nvenc {
+                        let src_stride = if stride == 0 { (width * 4) as usize } else { stride as usize };
+                        let dst_stride = src_frame.stride(0);
+                        let row_bytes = (width * 4) as usize;
+                        let rows = height as usize;
+                        let src_plane = bgra;
+                        let dst_plane = src_frame.data_mut(0);
+
+                        if src_stride < row_bytes
+                            || dst_stride < row_bytes
+                            || src_plane.len() < src_stride.saturating_mul(rows)
+                            || dst_plane.len() < dst_stride.saturating_mul(rows)
+                        {
+                            log::warn!(
+                                "[Encoder] Invalid BGRA stride/buffer: src_stride={}, dst_stride={}, row_bytes={}, src_len={}, dst_len={}",
+                                src_stride,
+                                dst_stride,
+                                row_bytes,
+                                src_plane.len(),
+                                dst_plane.len(),
+                            );
+                            None
+                        } else {
+                            for y in 0..rows {
+                                let src_off = y * src_stride;
+                                let dst_off = y * dst_stride;
+                                dst_plane[dst_off..dst_off + row_bytes]
+                                    .copy_from_slice(&src_plane[src_off..src_off + row_bytes]);
+                            }
+
+                            if scaler.run(&src_frame, &mut nv12_frame).is_err() {
+                                None
+                            } else {
+                                nv12_frame.set_pts(Some(capture_us as i64));
+                                clone_nv12_frame_owned(nv12_frame.as_ptr(), capture_us)
+                            }
+                        }
+                    } else {
                     encode_bgra_to_vaapi(
                         bgra, capture_us,
                         width, height,
+                            stride,
                         &mut src_frame, &mut nv12_frame,
                         &mut scaler,
                         hw_enc_ref,
                     )
+                    }
                 }
                 FrameData::DmaBuf { fd, stride, offset, modifier } => {
+                    if use_nvenc {
+                        log::debug!("[Encoder] NVENC path received DMA-BUF; dropping frame (CPU copy path expected)");
+                        libc::close(fd);
+                        None
+                    } else {
                     let imported = encode_dmabuf_to_vaapi(
                         fd, stride, offset, modifier, capture_us,
                         width, height,
@@ -395,29 +490,30 @@ fn run_encoder_loop(
                         }
                     } else {
                         None
+                        }
                     }
                 }
             }
         };
 
         // Возвращаем CPU-буфер в пул.
-        if let FrameData::Bgra(buf) = frame_data {
+        if let FrameData::Bgra { data: buf, .. } = frame_data {
             let _ = free_tx.send(buf);
         }
 
-        // Отправляем hw_frame в кодек.
-        if let Some(mut hw_frame) = hw_frame_opt {
+        // Отправляем frame в кодек.
+        if let Some(mut frame) = frame_opt {
             unsafe {
                 if force_idr {
-                    log::warn!("[Encoder] Client requested IDR. Forcing I-frame on current hardware frame.");
-                    (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_I;
-                    (*hw_frame).flags |= AV_FRAME_FLAG_KEY as i32;
+                    log::warn!("[Encoder] Client requested IDR. Forcing I-frame on current frame.");
+                    (*frame).pict_type = AVPictureType::AV_PICTURE_TYPE_I;
+                    (*frame).flags |= AV_FRAME_FLAG_KEY as i32;
                     force_idr = false;
                 } else {
-                    (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
-                    (*hw_frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
+                    (*frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
+                    (*frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
                 }
-                if avcodec_send_frame(encoder.as_mut_ptr(), hw_frame) >= 0 {
+                if avcodec_send_frame(encoder.as_mut_ptr(), frame) >= 0 {
                     let mut pkt = ffmpeg::Packet::empty();
                     while encoder.receive_packet(&mut pkt).is_ok() {
                         let original_capture_us = pkt.pts().unwrap_or(0) as u64;
@@ -493,17 +589,69 @@ fn run_encoder_loop(
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                     log::warn!("[Encoder] sink closed, shutting down");
-                                    av_frame_free(&mut hw_frame);
+                                    av_frame_free(&mut frame);
                                     return;
                                 }
                             }
                         }
                     }
                 }
-                av_frame_free(&mut hw_frame);
+                av_frame_free(&mut frame);
             }
         }
     }
+}
+
+unsafe fn clone_nv12_frame_owned(src: *const AVFrame, pts: u64) -> Option<*mut AVFrame> {
+    if src.is_null() {
+        return None;
+    }
+
+    let mut dst = av_frame_alloc();
+    if dst.is_null() {
+        return None;
+    }
+
+    (*dst).format = AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+    (*dst).width = (*src).width;
+    (*dst).height = (*src).height;
+
+    if av_frame_get_buffer(dst, 32) < 0 {
+        av_frame_free(&mut dst);
+        return None;
+    }
+
+    let w = (*src).width as usize;
+    let h = (*src).height as usize;
+
+    // Plane 0: Y (h rows, w bytes each)
+    let src_y_stride = (*src).linesize[0] as usize;
+    let dst_y_stride = (*dst).linesize[0] as usize;
+    for y in 0..h {
+        let src_off = y * src_y_stride;
+        let dst_off = y * dst_y_stride;
+        std::ptr::copy_nonoverlapping(
+            (*src).data[0].add(src_off),
+            (*dst).data[0].add(dst_off),
+            w,
+        );
+    }
+
+    // Plane 1: interleaved UV (h/2 rows, w bytes each)
+    let src_uv_stride = (*src).linesize[1] as usize;
+    let dst_uv_stride = (*dst).linesize[1] as usize;
+    for y in 0..(h / 2) {
+        let src_off = y * src_uv_stride;
+        let dst_off = y * dst_uv_stride;
+        std::ptr::copy_nonoverlapping(
+            (*src).data[1].add(src_off),
+            (*dst).data[1].add(dst_off),
+            w,
+        );
+    }
+
+    (*dst).pts = pts as i64;
+    Some(dst)
 }
 
 
@@ -723,15 +871,42 @@ unsafe fn vaapi_convert_frame_to_nv12(
 unsafe fn encode_bgra_to_vaapi(
     bgra:        &[u8],
     capture_us:  u64,
-    _width:       u32,
-    _height:      u32,
+    width:       u32,
+    height:      u32,
+    stride:      u32,
     src_frame:   &mut Video,
     nv12_frame:  &mut Video,
     scaler:      &mut scaling::Context,
     hw_frames_ref: *mut AVBufferRef,
 ) -> Option<*mut AVFrame> {
     unsafe {
-        src_frame.data_mut(0)[..bgra.len()].copy_from_slice(bgra);
+        let src_stride = if stride == 0 { (width * 4) as usize } else { stride as usize };
+        let dst_stride = src_frame.stride(0);
+        let row_bytes = (width * 4) as usize;
+        let rows = height as usize;
+        let dst = src_frame.data_mut(0);
+
+        if src_stride < row_bytes
+            || dst_stride < row_bytes
+            || bgra.len() < src_stride.saturating_mul(rows)
+            || dst.len() < dst_stride.saturating_mul(rows)
+        {
+            log::warn!(
+                "[Encoder] Invalid BGRA stride/buffer for VAAPI: src_stride={}, dst_stride={}, row_bytes={}, src_len={}, dst_len={}",
+                src_stride,
+                dst_stride,
+                row_bytes,
+                bgra.len(),
+                dst.len(),
+            );
+            return None;
+        }
+
+        for y in 0..rows {
+            let src_off = y * src_stride;
+            let dst_off = y * dst_stride;
+            dst[dst_off..dst_off + row_bytes].copy_from_slice(&bgra[src_off..src_off + row_bytes]);
+        }
         scaler.run(src_frame, nv12_frame).ok()?;
         nv12_frame.set_pts(Some(capture_us as i64));
 
