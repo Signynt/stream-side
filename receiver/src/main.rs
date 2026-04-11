@@ -40,6 +40,7 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
+#[cfg(target_os = "linux")]
 use ash::vk;
 use common::FrameTrace;
 use tokio::sync::mpsc;
@@ -50,14 +51,17 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use stream_receiver::backend::{
-    desktop::{DesktopFfmpegBackend},
-    VideoBackend, YuvFrame,
-};
+use stream_receiver::backend::YuvFrame;
+
+#[cfg(target_os = "macos")]
+use stream_receiver::backend::macos::MacosFfmpegBackend;
+
+#[cfg(not(target_os = "macos"))]
+use stream_receiver::backend::desktop::DesktopFfmpegBackend;
 use stream_receiver::network::run_quic_receiver;
 
-#[cfg(unix)]
-use stream_receiver::types::{DmaBufFrame};
+#[cfg(target_os = "linux")]
+use stream_receiver::types::DmaBufFrame;
 use stream_receiver::types::{DecodedFrame};
 // ─────────────────────────────────────────────────────────────────────────────
 // Канальный тип: CPU-кадр или zero-copy DMA-BUF кадр
@@ -71,7 +75,7 @@ use stream_receiver::types::{DecodedFrame};
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DMA-BUF Allocator (Vulkan import)
+// DMA-BUF Allocator (Vulkan import, Linux-only)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Держит raw Vulkan handles для импорта DMA-BUF fd в wgpu-текстуры.
@@ -81,6 +85,7 @@ use stream_receiver::types::{DecodedFrame};
 /// - `VK_KHR_external_memory`
 /// - `VK_KHR_external_memory_fd`
 /// - `VK_EXT_external_memory_dma_buf`
+#[cfg(target_os = "linux")]
 struct DmaBufAllocator {
     device:    ash::Device,
     ext_mem:   ash::khr::external_memory_fd::Device,
@@ -89,12 +94,14 @@ struct DmaBufAllocator {
 
 /// Drop-guard передаётся в wgpu-текстуру через `texture_from_raw`.
 /// Освобождает VkImage + VkDeviceMemory когда wgpu уничтожает текстуру.
+#[cfg(target_os = "linux")]
 struct VkTextureDropGuard {
     device: ash::Device,
     image:  vk::Image,
     memory: vk::DeviceMemory,
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for VkTextureDropGuard {
     fn drop(&mut self) {
         unsafe {
@@ -109,9 +116,13 @@ impl Drop for VkTextureDropGuard {
 
 // SAFETY: raw Vulkan handles (vk::Image, vk::DeviceMemory) являются числами;
 // ash::Device — тонкая обёртка над указателем, не имеет собственных данных.
+#[cfg(target_os = "linux")]
 unsafe impl Send for VkTextureDropGuard {}
+
+#[cfg(target_os = "linux")]
 unsafe impl Sync for VkTextureDropGuard {}
 
+#[cfg(target_os = "linux")]
 impl DmaBufAllocator {
     /// Инициализируем из raw Vulkan handles, извлечённых из wgpu HAL.
     ///
@@ -140,7 +151,7 @@ impl DmaBufAllocator {
     /// `fd` должен быть валидным DMA-BUF дескриптором.
     /// `wgpu_device` должен использовать Vulkan бэкенд.
     /// 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     unsafe fn import_plane(
         &self,
         wgpu_device: &wgpu::Device,
@@ -369,7 +380,7 @@ impl DmaBufAllocator {
     /// Возвращает (y_tex, uv_tex) или None при любой ошибке.
     /// При None вызывающий должен откатиться на CPU-путь.
     
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub unsafe fn import_nv12(
         &self,
         wgpu_device: &wgpu::Device,
@@ -414,6 +425,7 @@ impl DmaBufAllocator {
 // Вспомогательные функции
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     type_bits: u32,
@@ -451,11 +463,13 @@ struct WgpuState {
     // ── Zero-copy DMA-BUF ────────────────────────────────────────────────────
 
     /// None — Vulkan-расширения недоступны или бэкенд не Vulkan.
+    #[cfg(target_os = "linux")]
     dmabuf: Option<DmaBufAllocator>,
 
     /// Удерживает wgpu-текстуры предыдущего DMA-BUF кадра до тех пор, пока
     /// GPU гарантированно завершит чтение (swap происходит на следующем кадре).
     /// Необходимо, потому что queue.submit() — неблокирующий вызов.
+    #[cfg(target_os = "linux")]
     _prev_dmabuf_textures: Option<(wgpu::Texture, wgpu::Texture)>,
 }
 
@@ -497,6 +511,7 @@ impl WgpuState {
         //
         // Все three нужны для vkImportMemoryFdKHR и vkAllocateMemory.
 
+        #[cfg(target_os = "linux")]
         let dmabuf: Option<DmaBufAllocator> = unsafe {
             // Извлекаем device handle из device closure.
             let mut ash_device_opt: Option<ash::Device> = None;
@@ -658,7 +673,9 @@ impl WgpuState {
             bind_group_layout,
             sampler,
             textures:              None,
+            #[cfg(target_os = "linux")]
             dmabuf,
+            #[cfg(target_os = "linux")]
             _prev_dmabuf_textures: None,
         }
     }
@@ -719,7 +736,7 @@ impl WgpuState {
     }
 
     // ── Zero-copy путь: импортируем DMA-BUF fd как Vulkan текстуры ───────────
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn update_textures_dmabuf(&mut self, frame: &DmaBufFrame) -> bool {
         let alloc = match &self.dmabuf {
             Some(a) => a,
@@ -795,7 +812,10 @@ impl WgpuState {
         // При swap кадров освобождаем _prev_dmabuf_textures ПОСЛЕ submit,
         // поэтому достаточно дропнуть их здесь — queue.submit из предыдущего
         // кадра к этому моменту уже «закоммичен» в драйвер.
+        #[cfg(target_os = "linux")]
+        {
         self._prev_dmabuf_textures = None;
+        }
 
         let view    = surface_texture.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -877,7 +897,10 @@ impl ApplicationHandler for App {
                 let (frame_id, frame_trace) = match &decoded {
                     DecodedFrame::Yuv(f)    => (f.frame_id, f.trace),
 
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
+                    DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+
+                    #[cfg(not(target_os = "linux"))]
                     DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
                 };
 
@@ -887,12 +910,18 @@ impl ApplicationHandler for App {
                         state.update_textures_cpu(&frame);
                     }
 
-                    #[cfg(unix)]
+                    #[cfg(target_os = "linux")]
                     DecodedFrame::DmaBuf(frame) => {
                         if !state.update_textures_dmabuf(&frame) {
                             log::warn!("[Render] DMA-BUF import failed for frame #{}", frame_id);
                             return;
                         }
+                    }
+
+                    #[cfg(not(target_os = "linux"))]
+                    DecodedFrame::DmaBuf(_frame) => {
+                        log::warn!("[Render] DMA-BUF frame received on non-Linux build");
+                        return;
                     }
                 }
 
@@ -970,6 +999,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Capacity=3: при отставании рендера старые кадры выбрасываются → low-latency.
     let (tx, rx) = mpsc::channel::<DecodedFrame>(3);
 
+    #[cfg(target_os = "macos")]
+    let backend = MacosFfmpegBackend::new()?;
+
+    #[cfg(not(target_os = "macos"))]
     let backend = DesktopFfmpegBackend::new()?;
     let backend = Arc::new(Mutex::new(backend));
     let backend_clone = backend.clone();
