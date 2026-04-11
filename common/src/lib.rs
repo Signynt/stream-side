@@ -2,7 +2,7 @@ use serde::{Serialize, Deserialize};
 use bytes::{Bytes, BytesMut, BufMut};
 use std::{sync::atomic::AtomicI64, time::{SystemTime, UNIX_EPOCH}};
 
-
+pub mod fec;
 pub const TYPE_VIDEO: u8 = 0;
 pub const TYPE_AUDIO: u8 = 1;
 pub const TYPE_CONTROL: u8 = 2;
@@ -69,17 +69,20 @@ pub struct VideoPacket {
 #[derive(Debug)]
 pub struct DatagramChunk {
     pub frame_id:     u64,
-    pub chunk_idx:    u16,
-    pub total_chunks: u16,
-    pub flags:        u8,
+    pub slice_idx:    u8,  // Номер NALU (0..7)
+    pub total_slices: u8,  // Всего NALU в кадре (чтобы ресивер знал, когда кадр собран)
+    pub shard_idx:    u8,  // Номер шарда внутри этого слайса (0 .. k+m-1)
+    pub k:            u8,  // Количество шардов данных
+    pub m:            u8,  // Количество шардов четности
+    pub payload_len:  u16, // Реальный размер данных (нужно для отрезания нулей из-за паддинга FEC)
     pub packet_type:  u8,
-    /// Zero-copy Bytes slice of the raw datagram payload.
+    pub flags:        u8,
     pub data:         Bytes,
 }
 
 impl DatagramChunk {
     /// Fixed header size in bytes.
-    pub const HEADER_LEN: usize = 14; // 8 + 2 + 2 + 1 + 1
+    pub const HEADER_LEN: usize = 17; // 8 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1
 
     // ── Encoding ─────────────────────────────────────────────────────────────
 
@@ -88,13 +91,20 @@ impl DatagramChunk {
     /// `data` is appended verbatim after the 12-byte header — no extra copy
     /// is required if the caller already holds a contiguous `&[u8]`.
     #[inline]
-    pub fn encode(frame_id: u64, idx: u16, total: u16, p_type: u8, flags: u8, data: &[u8]) -> Bytes {
+    pub fn encode(
+        frame_id: u64, slice_idx: u8, total_slices: u8, shard_idx: u8,
+        k: u8, m: u8, payload_len: u16, p_type: u8, flags: u8, data: &[u8]
+    ) -> Bytes {
         let mut buf = BytesMut::with_capacity(Self::HEADER_LEN + data.len());
         buf.put_u64_le(frame_id);
-        buf.put_u16_le(idx);
-        buf.put_u16_le(total);
-        buf.put_u8(p_type); // Записываем тип
-        buf.put_u8(flags);  // Записываем флаги
+        buf.put_u8(slice_idx);
+        buf.put_u8(total_slices);
+        buf.put_u8(shard_idx);
+        buf.put_u8(k);
+        buf.put_u8(m);
+        buf.put_u16_le(payload_len);
+        buf.put_u8(p_type);
+        buf.put_u8(flags);
         buf.put_slice(data);
         buf.freeze()
     }
@@ -108,27 +118,27 @@ impl DatagramChunk {
     /// heap allocation for the payload bytes.
     #[inline]
     pub fn decode(raw: Bytes) -> Option<Self> {
-        if raw.len() < Self::HEADER_LEN {
-            return None;
-        }
-        
-        // Читаем строго по индексам:
-        let frame_id     = u64::from_le_bytes(raw[0..8].try_into().ok()?);    // 0..8
-        let chunk_idx    = u16::from_le_bytes(raw[8..10].try_into().ok()?);   // 8..10
-        let total_chunks = u16::from_le_bytes(raw[10..12].try_into().ok()?);  // 10..12
-        let packet_type  = raw[12];                                           // 12
-        let flags        = raw[13];                                           // 13
-        
-        let data         = raw.slice(Self::HEADER_LEN..);
-        
-        Some(Self { 
-            frame_id, 
-            chunk_idx, 
-            total_chunks, 
-            packet_type, 
-            flags, 
-            data 
+        if raw.len() < Self::HEADER_LEN { return None; }
+        Some(Self {
+            frame_id:     u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+            slice_idx:    raw[8],
+            total_slices: raw[9],
+            shard_idx:    raw[10],
+            k:            raw[11],
+            m:            raw[12],
+            payload_len:  u16::from_le_bytes(raw[13..15].try_into().unwrap()),
+            packet_type:  raw[15],
+            flags:        raw[16],
+            data:         raw.slice(Self::HEADER_LEN..),
         })
+    }
+
+    #[inline]
+    pub fn to_bytes(&self) -> Bytes {
+        Self::encode(
+            self.frame_id, self.slice_idx, self.total_slices, self.shard_idx,
+            self.k, self.m, self.payload_len, self.packet_type, self.flags, &self.data
+        )
     }
 }
 

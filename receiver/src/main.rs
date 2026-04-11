@@ -63,6 +63,8 @@ use stream_receiver::network::run_quic_receiver;
 #[cfg(target_os = "linux")]
 use stream_receiver::types::DmaBufFrame;
 use stream_receiver::types::{DecodedFrame};
+use stream_receiver::UserEvent;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Канальный тип: CPU-кадр или zero-copy DMA-BUF кадр
 // ─────────────────────────────────────────────────────────────────────────────
@@ -872,7 +874,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             let attrs = Window::default_attributes()
@@ -882,13 +884,16 @@ impl ApplicationHandler for App {
             let window = Arc::new(event_loop.create_window(attrs).unwrap());
             self.state  = Some(pollster::block_on(WgpuState::new(window.clone())));
             self.window = Some(window);
-
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
     }
 
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::NewFrame => {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(decoded) = self.poll_latest_frame() {
             if let Some(state) = self.state.as_mut() {
@@ -933,12 +938,14 @@ impl ApplicationHandler for App {
                 }
                 
                 if let Some(w) = &self.window {
-                    w.request_redraw();
+                    w.request_redraw(); // Просто будим окно
                 }
             }
         }
-        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
     }
+
+    // fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    // }
 
     fn window_event(
         &mut self,
@@ -964,11 +971,49 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                state.render();
+                if let Some(decoded) = self.poll_latest_frame() {
+                    if let Some(state) = self.state.as_mut() {
+                        
+                        let (frame_id, frame_trace) = match &decoded {
+                            DecodedFrame::Yuv(f) => (f.frame_id, f.trace),
+                            #[cfg(unix)]
+                            DecodedFrame::DmaBuf(f) => (f.frame_id, f.trace),
+                        };
+
+                        match decoded {
+                            DecodedFrame::Yuv(frame) => state.update_textures_cpu(&frame),
+                            #[cfg(unix)]
+                            DecodedFrame::DmaBuf(frame) => {
+                                if !state.update_textures_dmabuf(&frame) { return; }
+                            }
+                        }
+
+                        let mut t = frame_trace;
+                        if t.capture_us != 0 {
+                            t.present_us = FrameTrace::now_us();
+                            let _ = self.trace_tx.send(Some((frame_id, t)));
+                        }
+
+                        state.render();
+                        if !self.frame_rx.is_empty() { if let Some(w) = &self.window { w.request_redraw() }; }
+                    }
+                }
+
+                // Draw initial window
+                if let Some(state) = self.state.as_mut() {
+                    state.render();
+                }
+
+                // If queue is not empty, plan for a render
+                if !self.frame_rx.is_empty() {
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
             }
             _ => {}
         }
-    }
+    }   
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1010,10 +1055,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let (trace_tx, trace_rx) = watch::channel::<Option<(u64, FrameTrace)>>(None);
     
-    // Сетевой поток.
-    // Примечание: network.rs::receive_datagrams нужно обновить:
-    //   FrameOutput::DmaBuf(frame) → tx.try_send(DecodedFrame::DmaBuf(frame))
-    //   FrameOutput::Yuv(frame)    → tx.try_send(DecodedFrame::Yuv(frame))
+    // Рендер-поток (главный поток — требование winit).
+    let event_loop: EventLoop<UserEvent> = EventLoop::with_user_event().build()?;
+
+    #[cfg(not(target_os = "android"))]
+    let proxy = Some(event_loop.create_proxy());
+    #[cfg(target_os = "android")]
+    let proxy = None;
+
     std::thread::Builder::new()
         .name("quic-receiver".into())
         .spawn(move || {
@@ -1024,12 +1073,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async move {
-                run_quic_receiver(backend_clone, addr, Some(tx_clone), trace_rx).await;
+                run_quic_receiver(backend_clone, addr, Some(tx_clone), trace_rx, proxy).await;
             }));
         })?;
 
-    // Рендер-поток (главный поток — требование winit).
-    let event_loop = EventLoop::new()?;
+
     let mut app = App {
         state:           None,
         window:          None,

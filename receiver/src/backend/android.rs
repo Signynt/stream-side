@@ -333,7 +333,7 @@ pub extern "system" fn Java_com_example_streamreceiver_NativeLib_startNetworking
             handle.block_on(async move {
                 // run_quic_receiver — бесконечный reconnect-loop
                 // frame_tx = None: кадры рендерятся прямо в Surface
-                if let Err(e) = crate::network::run_quic_receiver(backend, addr, None, trace_rx).await {
+                if let Err(e) = crate::network::run_quic_receiver(backend, addr, None, trace_rx, None).await {
                     log::error!("[Network] Fatal: {}", e);
                 }
             });

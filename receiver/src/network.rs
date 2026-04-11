@@ -32,16 +32,16 @@ use std::{
     time::Duration,
 };
 use std::sync::atomic::{AtomicI64, Ordering};
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::JoinHandle, time::{self, Instant}};
 use tokio::sync::mpsc;
 use bytes::Bytes;
-use common::{CLOCK_OFFSET, ControlPacket, DatagramChunk, FrameTrace, TYPE_AUDIO, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
+use common::{CLOCK_OFFSET, ControlPacket, DatagramChunk, FrameTrace, TYPE_AUDIO, TYPE_CONTROL, TYPE_VIDEO, VideoPacket, fec::FrameAssembler};
 use quinn::{Endpoint, SendStream};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::DigitallySignedStruct;
 
-use crate::{JITTER_TARGET_MS, JitterBuffer, JitterEntry, backend::{FrameOutput, PushStatus, VideoBackend}, types::DecodedFrame};
+use crate::{JITTER_TARGET_MS, JitterBuffer, JitterEntry, backend::{FrameOutput, PushStatus, VideoBackend}, platform::AppProxy, types::DecodedFrame};
 // ─────────────────────────────────────────────────────────────────────────────
 // Datagram reassembly buffer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -49,57 +49,9 @@ use crate::{JITTER_TARGET_MS, JitterBuffer, JitterEntry, backend::{FrameOutput, 
 // а старое значение сохраняется на 90%.
 const OFFSET_ALPHA: f64 = 0.01;
 struct VideoState {
-    reassembly: HashMap<u64, ReassemblyBuf>,
     waiting_for_key: bool,
     expected_frame_id: Option<u64>,
 }
-struct ReassemblyBuf {
-    /// Slot per chunk index; `None` until the chunk arrives.
-    chunks:   Vec<Option<Bytes>>,
-    received: u16,
-    total:    u16,
-    is_key:       bool,   // ← НОВОЕ: чтобы не эвиктировать IDR
-    first_us:     u64,
-}
-
-impl ReassemblyBuf {
-    fn new(total_chunks: u16, is_key: bool) -> Self {
-        Self {
-            chunks:   vec![None; total_chunks as usize],
-            received: 0,
-            total:    total_chunks,
-            is_key,
-            first_us: FrameTrace::now_us(),
-        }
-    }
-
-    /// Insert a chunk.  Returns `true` when all chunks have arrived.
-    fn insert(&mut self, idx: u16, data: Bytes) -> bool {
-        let slot = &mut self.chunks[idx as usize];
-        if slot.is_none() {
-            *slot = Some(data);
-            self.received += 1;
-        }
-        self.received == self.total
-    }
-
-    /// Concatenate all chunks into a contiguous buffer.
-    ///
-    /// Must only be called when `insert` returned `true`.
-    fn assemble(self) -> Vec<u8> {
-        let total_len: usize = self.chunks.iter()
-            .filter_map(|c| c.as_ref())
-            .map(|b| b.len())
-            .sum();
-
-        let mut out = Vec::with_capacity(total_len);
-        for chunk in self.chunks {
-            out.extend_from_slice(&chunk.expect("assemble: incomplete chunk"));
-        }
-        out
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -122,6 +74,7 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
     sender_addr: SocketAddr,
     frame_tx: Option<mpsc::Sender<DecodedFrame>>,
     trace_rx: watch::Receiver<Option<(u64, FrameTrace)>>,
+    proxy: AppProxy
 ) -> Result<(), Box<dyn Error>> {
     rustls::crypto::ring::default_provider().install_default().ok();
 
@@ -172,8 +125,9 @@ pub async fn run_quic_receiver<B: VideoBackend + Send + 'static>(
 
         // Основной цикл приёма датаграмм.
         // Когда он завершается — считаем соединение потерянным.
-        let (idr_needed_tx, idr_needed_rx) = watch::channel(false);
-        receive_datagrams(conn.clone(), backend.clone(), control_tx.clone(), idr_needed_tx).await;
+        let proxy_clone = proxy.clone();
+        let (idr_needed_tx, _idr_needed_rx) = watch::channel(false);
+        receive_datagrams(conn.clone(), backend.clone(), control_tx.clone(), idr_needed_tx, proxy_clone).await;
 
         // Останавливаем все фоновые задачи этого соединения.
         for handle in task_handles {
@@ -224,30 +178,21 @@ fn spawn_control_writer_task(
     mut control_rx: mpsc::Receiver<ControlPacket>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut uni_send = match conn.open_uni().await {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("[QUIC] open_uni failed: {e}");
-                return;
-            }
-        };
-
         while let Some(packet) = control_rx.recv().await {
-            let bytes = match postcard::to_stdvec(&packet) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!("[QUIC] control serialize error: {e}");
-                    continue;
+            if let Ok(bytes) = postcard::to_stdvec(&packet) {
+                // Шлем как датаграмму, чтобы не зависеть от Window Updates
+                let dgram = DatagramChunk::encode(
+                    0, 0, 1, 0, 1, 0, 
+                    bytes.len() as u16, 
+                    TYPE_CONTROL, 
+                    0, 
+                    &bytes
+                );
+                
+                if let Err(e) = conn.send_datagram(dgram) {
+                    log::warn!("[QUIC] Failed to send control dgram: {e}");
+                    // Не выходим из цикла! Просто идем дальше.
                 }
-            };
-
-            let len = (bytes.len() as u32).to_le_bytes();
-
-            if uni_send.write_all(&len).await.is_err() {
-                break;
-            }
-            if uni_send.write_all(&bytes).await.is_err() {
-                break;
             }
         }
     })
@@ -272,7 +217,8 @@ fn spawn_trace_feedback_task(
 
                     let packet = ControlPacket::FrameFeedback { frame_id, trace };
                     if control_tx.send(packet).await.is_err() {
-                        continue;
+                        log::warn!("[NETWORK] Trace feedback task is broken!");
+                        break;
                     }
                 }
             }
@@ -290,7 +236,11 @@ fn spawn_ping_task(conn: quinn::Connection) -> JoinHandle<()> {
             };
 
             if let Ok(bytes) = postcard::to_stdvec(&ping) {
-                let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bytes);
+                let dgram = DatagramChunk::encode(
+                    0, 0, 1, 0, 1, 0, 
+                    bytes.len() as u16, 
+                    TYPE_CONTROL, 0, &bytes
+                );
                 let _ = conn.send_datagram(dgram);
             }
 
@@ -424,7 +374,7 @@ pub async fn send_offset_update(conn: &quinn::Connection, rtt_us: u64) -> Result
     let packet = ControlPacket::OffsetUpdate { offset_us: offset, rtt_us };
 
     let bin = postcard::to_stdvec(&packet)?;
-    let dgram = DatagramChunk::encode(0, 0, 1, TYPE_CONTROL, 0, &bin);
+    let dgram = DatagramChunk::encode(0, 0, 1, 0, 1, 0, bin.len() as u16, TYPE_CONTROL, 0, &bin);
     conn.send_datagram(dgram)?;
 
     Ok(())
@@ -435,25 +385,58 @@ async fn receive_datagrams<B: VideoBackend>(
     backend:  Arc<Mutex<B>>,
     control_tx: mpsc::Sender<ControlPacket>,
     idr_needed_tx: watch::Sender<bool>,
+    proxy: AppProxy,
 ) {
     let idr_needed_rx = idr_needed_tx.subscribe();
     let mut video_state = VideoState {
-        reassembly: HashMap::new(),
         waiting_for_key: true,
         expected_frame_id: None,
     };
     let mut jitter_buf = JitterBuffer::new(JITTER_TARGET_MS);
+    let mut assembler = FrameAssembler::new();
+    
+    let sleep_until = Instant::now() + Duration::from_secs(3600);
+    let sleep = time::sleep_until(sleep_until);
+    tokio::pin!(sleep);
     loop {
         // ── Sleep duration until the next buffered frame is due ───────────────
         // If the buffer is empty we park the timer for 1 hour; it will be
         // cancelled the moment the datagram arm fires.
-        let drain_sleep = match jitter_buf.time_to_next() {
-            Some(d) => d,
-            None    => Duration::from_secs(3600),
+        let next_deadline = match jitter_buf.time_to_next() {
+            Some(d) => Instant::now() + d,
+            None    => Instant::now() + Duration::from_secs(3600),
         };
+        sleep.as_mut().reset(next_deadline);
 
+        
         tokio::select! {
             // ── 1. Incoming datagram ─────────────────────────────────────────
+                        // ── 2. Jitter-buffer drain timer ─────────────────────────────────
+            // Fires when the earliest buffered frame has waited long enough.
+            // All frames whose deadline has now passed are released at once.
+            _ = &mut sleep => {
+                let ready = jitter_buf.drain_ready();
+                if ready.is_empty() { continue; }
+ 
+                log::trace!("[JitterBuf] releasing {} frame(s)", ready.len());
+ 
+                for packet in ready {
+                    push_frame_to_backend(
+                        packet,
+                        &mut video_state,
+                        &backend,
+                        &control_tx,
+                        &idr_needed_tx,
+                        &idr_needed_rx,
+                    ).await;
+                }
+
+                #[cfg(not(target_os = "android"))]
+                if let Some(p) = &proxy {
+                    let _ = p.send_event(crate::UserEvent::NewFrame);
+                }
+            }
+
             raw = conn.read_datagram() => {
                 let raw = match raw {
                     Ok(b)  => b,
@@ -471,7 +454,7 @@ async fn receive_datagrams<B: VideoBackend>(
                     TYPE_VIDEO => {
                         // Reassemble; if a frame completed, enqueue it in the
                         // jitter buffer instead of pushing to the backend directly.
-                        if let Some(packet) = reassemble_chunk(chunk, &mut video_state) {
+                        if let Some(packet) = assembler.insert(&chunk) {
                             jitter_buf.push(packet);
                         }
                     }
@@ -492,80 +475,9 @@ async fn receive_datagrams<B: VideoBackend>(
                     _ => log::warn!("Unknown packet type"),
                 }
             }
- 
-            // ── 2. Jitter-buffer drain timer ─────────────────────────────────
-            // Fires when the earliest buffered frame has waited long enough.
-            // All frames whose deadline has now passed are released at once.
-            _ = tokio::time::sleep(drain_sleep) => {
-                let ready = jitter_buf.drain_ready();
-                if ready.is_empty() { continue; }
- 
-                log::trace!("[JitterBuf] releasing {} frame(s)", ready.len());
- 
-                for packet in ready {
-                    push_frame_to_backend(
-                        packet,
-                        &mut video_state,
-                        &backend,
-                        &control_tx,
-                        &idr_needed_tx,
-                        &idr_needed_rx,
-                    ).await;
-                }
-            }
         }
         
     }
-}
-
-fn reassemble_chunk(
-    chunk: DatagramChunk,
-    state: &mut VideoState,
-) -> Option<VideoPacket> {
-    let frame_id = chunk.frame_id;
-    let is_key   = chunk.flags & 1 != 0;
-    const MAX_BUFFERED_FRAMES: usize = 8;
- 
-    if chunk.chunk_idx >= chunk.total_chunks {
-        log::warn!(
-            "[Video] Drop corrupted chunk: idx {} >= total {}",
-            chunk.chunk_idx, chunk.total_chunks
-        );
-        return None;
-    }
- 
-    if is_key && chunk.chunk_idx == 0 {
-        if !state.reassembly.contains_key(&frame_id) {
-            state.reassembly.clear();
-        }
-    }
- 
-    state.reassembly
-        .retain(|&id, _| id >= frame_id.saturating_sub(MAX_BUFFERED_FRAMES as u64));
- 
-    let buf = state.reassembly
-        .entry(frame_id)
-        .or_insert_with(|| ReassemblyBuf::new(chunk.total_chunks, is_key));
- 
-    if !buf.insert(chunk.chunk_idx, chunk.data) {
-        return None; // frame not yet complete
-    }
- 
-    // All chunks arrived — assemble and deserialise.
-    let buf      = state.reassembly.remove(&frame_id).unwrap();
-    let first_us = buf.first_us;
- 
-    let mut packet: VideoPacket = match postcard::from_bytes(&buf.assemble()) {
-        Ok(p)  => p,
-        Err(e) => { log::error!("[Video] Postcard decode error: {e}"); return None; }
-    };
- 
-    packet.trace.as_mut().map(|t| {
-        t.receive_us     = first_us;
-        t.reassembled_us = FrameTrace::now_us();
-    });
- 
-    Some(packet)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -601,7 +513,7 @@ async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
         let tx = control_tx.clone();
         let mut rx = idr_needed_rx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(300));
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
             // Loop as long as the watch value is 'true'
             while *rx.borrow() {
                 if tx.send(ControlPacket::RequestKeyFrame).await.is_err() {
@@ -697,11 +609,11 @@ fn build_quic_client_endpoint() -> Result<Endpoint, Box<dyn Error>> {
     // ── Transport — mirror the server settings for symmetrical behaviour ──────
     let mut t = quinn::TransportConfig::default();
 
-    t.datagram_receive_buffer_size(Some(1 * 1024 * 1024));
+    t.datagram_receive_buffer_size(Some(16 * 1024 * 1024));
 
     // Match the server's initial MTU probe so the first handshake uses the
     // optimal path MTU immediately rather than starting at 1200.
-    t.initial_mtu(1400);
+    t.initial_mtu(1200);
 
     // Keep-alive: same period as server so both sides detect dead connections
     // within a consistent window.
@@ -833,8 +745,8 @@ fn linux_identity() -> (String, String) {
     let model = std::env::var("CLIENT_MODEL")
         .unwrap_or_else(|_| format!("Linux {}", std::env::consts::ARCH));
 
-    let name = std::env::var("$HOSTNAME")
-        .or_else(|_| std::env::var("$CLIENT_NAME"))
+    let name = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("CLIENT_NAME"))
         .unwrap_or_else(|_| "Linux-host".to_string());
 
     (model, name)
