@@ -38,6 +38,8 @@ use tokio::sync::mpsc as async_mpsc;
 
 use common::FrameTrace;
 
+use crate::encode::EncodedFrame;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Константы DRM fourcc / modifier
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,7 +62,10 @@ pub enum FrameData {
     ///
     /// Буфер взят из пула двойной буферизации и должен быть возвращён
     /// через `free_tx` после использования.
-    Bgra(Vec<u8>),
+    Bgra{
+        data: Vec<u8>,
+        stride: u32,
+    },
 
     /// DMA-BUF кадр — нулевое копирование на CPU.
     ///
@@ -80,7 +85,7 @@ pub enum FrameData {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// VAAPI HEVC энкодер с поддержкой DMA-BUF zero-copy и CPU fallback.
-pub struct Encoder {
+pub struct VaapiEncoder {
     tx:       SyncSender<(FrameData, u64)>,
     _worker:  thread::JoinHandle<()>,
     /// Пул CPU-буферов (только для пути Bgra).
@@ -88,7 +93,7 @@ pub struct Encoder {
     idr_rx: tokio::sync::watch::Receiver<bool>,
 }
 
-impl Encoder {
+impl VaapiEncoder {
     /// Инициализация VAAPI HEVC энкодера.
     ///
     /// Порождает один OS-поток для цикла кодирования.
@@ -124,11 +129,11 @@ impl Encoder {
     /// Отправить BGRA-кадр (CPU-путь) на кодирование.
     ///
     /// Если пул буферов пуст (энкодер не успевает) — кадр молча дропается.
-    pub fn encode_bgra(&self, frame: &[u8], capture_us: u64) {
+    pub fn encode_bgra(&self, frame: &[u8], stride: u32, capture_us: u64) {
         if let Ok(mut buf) = self.free_rx.try_recv() {
             let len = frame.len().min(buf.len());
             buf[..len].copy_from_slice(&frame[..len]);
-            let _ = self.tx.try_send((FrameData::Bgra(buf), capture_us));
+            let _ = self.tx.try_send((FrameData::Bgra {data: buf, stride }, capture_us));
         }
     }
 
@@ -144,19 +149,6 @@ impl Encoder {
             unsafe { libc::close(fd); }
         }
     }
-
-    /// Устаревший метод для обратной совместимости — делегирует в `encode_bgra`.
-    #[inline]
-    pub fn encode(&self, frame: &[u8], capture_us: u64) {
-        self.encode_bgra(frame, capture_us);
-    }
-}
-
-pub struct EncodedFrame {
-    pub frame_id: u64,
-    pub slices: Vec<Bytes>,
-    pub is_key:  bool,
-    pub trace:   Option<FrameTrace>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,26 +279,6 @@ fn run_encoder_loop(
     let (hw_enc_ref, hw_import_ref, drm_frames_ref, mut vaapi_convert_graph) =
         unsafe { init_hw_contexts(enc_ctx.as_mut_ptr(), width, height) };
 
-    // unsafe {
-    //     dump_transfer_formats(
-    //         "DRM FROM",
-    //         drm_frames_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_FROM,
-    //     );
-
-    //     dump_transfer_formats(
-    //         "VAAPI TO",
-    //         hw_enc_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-    //     );
-
-    //     dump_transfer_formats(
-    //         "IMPORTED BGRA",
-    //         hw_import_ref,
-    //         AVHWFrameTransferDirection::AV_HWFRAME_TRANSFER_DIRECTION_TO,
-    //     );
-    // }
-
     if drm_frames_ref.is_null() {
         log::warn!("[Encoder] DRM hw_frames_ctx not available — DMA-BUF disabled. \
                     SPA_DATA_DmaBuf frames will be dropped.");
@@ -349,11 +321,10 @@ fn run_encoder_loop(
             Ok(v)  => v,
             Err(_) => break,
         };
-
         // Дренируем канал: берём самый свежий кадр.
         while let Ok(newer) = rx.try_recv() {
             match frame_data {
-                FrameData::Bgra(buf) => { let _ = free_tx.send(buf); }
+                FrameData::Bgra{data: buf, ..} => { let _ = free_tx.send(buf); }
                 FrameData::DmaBuf { fd, .. } => unsafe { libc::close(fd); },
             }
             frame_data  = newer.0;
@@ -369,7 +340,7 @@ fn run_encoder_loop(
         // Получаем VAAPI hw_frame в зависимости от типа входа.
         let hw_frame_opt: Option<*mut AVFrame> = unsafe {
             match frame_data {
-                FrameData::Bgra(ref bgra) => {
+                FrameData::Bgra{ data: ref bgra, stride} => {
                     encode_bgra_to_vaapi(
                         bgra, capture_us,
                         width, height,
@@ -401,7 +372,7 @@ fn run_encoder_loop(
         };
 
         // Возвращаем CPU-буфер в пул.
-        if let FrameData::Bgra(buf) = frame_data {
+        if let FrameData::Bgra {data: buf, stride} = frame_data {
             let _ = free_tx.send(buf);
         }
 
@@ -861,14 +832,6 @@ unsafe fn encode_dmabuf_to_vaapi(
             av_frame_free(&mut imported);
             return None;
         }
-
-        // log::info!(
-        //     "[Mapping Success] Format: {:?}, Linesize: [{}, {}, ...]",
-        //     (*imported).format,
-        //     (*imported).linesize[0],
-        //     (*imported).linesize[1]
-        // );
-        // log::info!("[VAAPI Details] Surface ID: {}", (*imported).data[3] as usize);
     }
 
     Some(imported)
@@ -1059,64 +1022,4 @@ unsafe fn create_vaapi_frames(
     assert!(ret >= 0, "av_hwframe_ctx_init(VAAPI) failed: {ret}");
     (*codec_ctx).hw_frames_ctx = av_buffer_ref(frames);
     frames
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PipeWire buffer → raw slice (CPU fallback, только MemPtr / MemFd)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Извлекает пиксельный срез из PipeWire-буфера и вызывает `f` с ним.
-///
-/// Обрабатывает `SPA_DATA_MemPtr` и `SPA_DATA_MemFd`.
-/// `SPA_DATA_DmaBuf` **не обрабатывается** — для него используй
-/// [`Encoder::encode_dmabuf`] напрямую.
-///
-/// # Safety
-/// `buffer` должен быть валидным `pw_buffer`, полученным от
-/// `stream.dequeue_raw_buffer()` и ещё не возвращённым.
-pub unsafe fn process_frame_from_pw_buffer<F>(buffer: *mut pw_sys::pw_buffer, mut f: F)
-where
-    F: FnMut(&[u8]),
-{
-    unsafe {
-        if buffer.is_null() || (*buffer).buffer.is_null() { return; }
-        let spa_buf = &*(*buffer).buffer;
-        if spa_buf.n_datas == 0 || spa_buf.datas.is_null() { return; }
-
-        let data  = &*spa_buf.datas;
-        let chunk = data.chunk.as_ref().unwrap();
-        let offset = chunk.offset as usize;
-        let size   = chunk.size   as usize;
-        if size == 0 { return; }
-
-        match data.type_ {
-            spa_sys::SPA_DATA_MemFd => {
-                let map_len = data.maxsize as usize;
-                let mapped  = mmap(
-                    ptr::null_mut(), map_len, PROT_READ,
-                    MAP_SHARED, data.fd as c_int, data.mapoffset as libc::off_t,
-                );
-                if mapped != MAP_FAILED {
-                    if offset + size <= map_len {
-                        let src = slice::from_raw_parts(
-                            (mapped as *const u8).add(offset), size,
-                        );
-                        f(src);
-                    }
-                    munmap(mapped, map_len);
-                }
-            }
-            spa_sys::SPA_DATA_MemPtr => {
-                if !data.data.is_null() {
-                    let src = slice::from_raw_parts(
-                        (data.data as *const u8).add(offset), size,
-                    );
-                    f(src);
-                }
-            }
-            // DmaBuf обрабатывается выше, в process-коллбэке linux.rs.
-            _ => {}
-        }
-    }
 }

@@ -54,7 +54,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::io::FromRawFd;
 use std::ptr;
 
-use common::FrameTrace;
+use common::{FrameTrace, GpuVendor, detect_gpu_vendor};
 
 use crate::backend::PushStatus;
 #[cfg(unix)]
@@ -70,11 +70,6 @@ use ffmpeg_next::{
 
 use super::{BackendError, FrameOutput, VideoBackend, YuvFrame};
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DMA-BUF frame descriptor — передаётся в render-поток
-// ─────────────────────────────────────────────────────────────────────────────
-
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Struct
@@ -84,7 +79,7 @@ pub struct DesktopFfmpegBackend {
     decoder:        ffmpeg_next::decoder::Video,
     scaler:         Option<scaling::Context>,
     last_fmt:       Pixel,
-    pending_traces: HashMap<u64, Option<FrameTrace>>,
+    pending_traces: HashMap<u64, (u64, Option<FrameTrace>)>,
 
     // ── CPU-путь (fallback) ──────────────────────────────────────────────────
 
@@ -144,9 +139,14 @@ impl DesktopFfmpegBackend {
         // чтобы DMA-BUF экспортированный FFmpeg мог быть импортирован
         // Vulkan без EINVAL.
 
-        let (vaapi_dev, drm_dev, dmabuf_enabled) = unsafe {
-            init_vaapi_from_drm(ctx.as_mut_ptr())
-        };
+        let (vaapi_dev, drm_dev, raw_dmabuf) = unsafe { init_vaapi_from_drm(ctx.as_mut_ptr()) };
+
+        // env variables remained for versatility
+
+        // NVIDIA + Vulkan DMA-BUF import can produce chroma artifacts on some stacks.
+        // Default to CPU fallback there; allow override with RECEIVER_FORCE_DMABUF=1.
+        let gpu = detect_gpu_vendor();
+        let dmabuf_enabled = Self::evaluate_dmabuf_support(raw_dmabuf, gpu);
 
         unsafe {
             if !vaapi_dev.is_null() {
@@ -199,6 +199,19 @@ impl DesktopFfmpegBackend {
             dmabuf_enabled,
         })
     }
+    fn evaluate_dmabuf_support(initial: bool, gpu: GpuVendor) -> bool {
+        let force = std::env::var("RECEIVER_FORCE_DMABUF").as_deref() == Ok("1");
+        let disable = std::env::var("RECEIVER_DISABLE_DMABUF").as_deref() == Ok("1");
+
+        if force { return true; }
+        if disable { return false; }
+        if gpu == GpuVendor::Nvidia { 
+            log::info!("Detected NVIDIA GPU, disabling DMA-BUF (for now)");
+            return false; 
+        }
+        
+        initial
+    }
 }
 
 impl Drop for DesktopFfmpegBackend {
@@ -232,18 +245,19 @@ impl VideoBackend for DesktopFfmpegBackend {
         if let Some(dst) = pkt.data_mut() {
             dst.copy_from_slice(payload);
         }
-        pkt.set_pts(Some(frame_id as i64));
-        pkt.set_dts(Some(frame_id as i64));
+        let pts_key = FrameTrace::now_us();
+        pkt.set_pts(Some(pts_key as i64));
+        pkt.set_dts(Some(pts_key as i64));
 
         self.decoder.send_packet(&pkt)
             .map_err(|e| BackendError::DecodeError(e.to_string()))?;
 
-        self.pending_traces.insert(frame_id, trace);
+        self.pending_traces.insert(pts_key, (frame_id, trace));
 
-        const TRACE_HORIZON: u64 = 120;
-        if frame_id > TRACE_HORIZON {
-            self.pending_traces.retain(|&k, _| k >= frame_id - TRACE_HORIZON);
-        }
+        // Evict entries older than ~2 seconds to bound memory use.
+        // (2 000 000 µs ≈ 2 s; covers any realistic decode latency.)
+        const HORIZON_US: u64 = 5_000_000;
+        self.pending_traces.retain(|&k, _| k >= pts_key.saturating_sub(HORIZON_US));
         Ok(PushStatus::Accepted)
     }
 
@@ -257,18 +271,22 @@ impl VideoBackend for DesktopFfmpegBackend {
 
         // ── 2. Метаданные ─────────────────────────────────────────────────────
 
-        let (frame_id, fmt, w, h) = unsafe {
+        let (pts_key, fmt, w, h) = unsafe {
             let f: &AVFrame = &*raw.as_ptr();
-            let fid = if f.pts != AV_NOPTS_VALUE { f.pts as u64 } else { 0 };
+            // f.pts is the wall-clock key we stored in push_encoded.
+            // If VAAPI still loses it we fall back to 0 and miss the trace,
+            // which is harmless (trace becomes Default) — but capture_us will
+            // be 0 only in that degenerate case, not always.
+            let key = if f.pts != AV_NOPTS_VALUE { f.pts as u64 } else { 0 };
             let fmt_sys: AVPixelFormat = std::mem::transmute(f.format);
-            (fid, Pixel::from(fmt_sys), f.width as u32, f.height as u32)
+            (key, Pixel::from(fmt_sys), f.width as u32, f.height as u32)
         };
 
-        let trace = self.pending_traces
-            .remove(&frame_id)
-            .flatten()
-            .unwrap_or_default();
-        let mut trace = trace;
+        let (frame_id, raw_trace) = self.pending_traces
+            .remove(&pts_key)
+            .unwrap_or((0, None));
+ 
+        let mut trace = raw_trace.unwrap_or_default();
         trace.decode_us = FrameTrace::now_us();
 
         // ── 3. Zero-copy путь: VAAPI → av_hwframe_map → DRM_PRIME ────────────
