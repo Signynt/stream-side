@@ -62,7 +62,7 @@ impl AnyEncoder {
         width:  u32,
         height: u32,
         sink:   mpsc::Sender<EncodedFrame>,
-        idr_rx: watch::Receiver<bool>,
+        idr_rx: watch::Receiver<u64>,
         tuning: Arc<SenderTuning>,
     ) -> Self {
         match detect_gpu_vendor() {

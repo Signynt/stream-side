@@ -73,7 +73,7 @@ pub struct NvencEncoder {
     _worker:  thread::JoinHandle<()>,
     /// Пул CPU-буферов (только для пути Bgra).
     free_rx:  mpsc::Receiver<Vec<u8>>,
-    idr_rx: tokio::sync::watch::Receiver<bool>,
+    idr_rx: tokio::sync::watch::Receiver<u64>,
 }
 
 impl NvencEncoder {
@@ -89,7 +89,7 @@ impl NvencEncoder {
         width: u32,
         height: u32,
         sink: async_mpsc::Sender<EncodedFrame>,
-        idr_rx: tokio::sync::watch::Receiver<bool>,
+        idr_rx: tokio::sync::watch::Receiver<u64>,
         tuning: Arc<SenderTuning>,
     ) -> Self {
         let (tx, rx)             = mpsc::sync_channel::<(FrameData, u64)>(4);
@@ -182,7 +182,7 @@ fn run_encoder_loop(
     free_tx:  mpsc::Sender<Vec<u8>>,
     ready_tx: mpsc::Sender<()>,
     sink:     async_mpsc::Sender<EncodedFrame>,
-    mut idr_rx: tokio::sync::watch::Receiver<bool>,
+    mut idr_rx: tokio::sync::watch::Receiver<u64>,
     tuning: Arc<SenderTuning>,
 ) {
     // ── Codec init ─────────────────────────────────────────────────
@@ -272,9 +272,8 @@ fn run_encoder_loop(
         }
 
         if idr_rx.has_changed().unwrap_or(false) {
-            if *idr_rx.borrow_and_update() == true {
-                force_idr = true;
-            }
+            let _ = *idr_rx.borrow_and_update();
+            force_idr = true;
         }
 
         // Получаем VAAPI hw_frame в зависимости от типа входа.
@@ -347,7 +346,6 @@ fn run_encoder_loop(
                         (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
                         (*hw_frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
                     }
-                    force_idr = false;
                 } else {
                     (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
                     (*hw_frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
@@ -362,6 +360,10 @@ fn run_encoder_loop(
                         trace.encode_us    = FrameTrace::now_us();
 
                         let is_key = pkt.is_key();
+
+                        if force_idr && is_key {
+                            force_idr = false;
+                        }
 
                         if !started {
                             if !is_key { 

@@ -75,7 +75,7 @@ fn split_slices_for_fec(frame: &EncodedFrame, max_chunk_data: usize) -> Vec<Byte
 pub struct QuicServer {
     /// Cloneable handle for pushing encoded frames into the transport pipeline.
     frame_tx: mpsc::Sender<EncodedFrame>,
-    idr_tx: tokio::sync::watch::Sender<bool>,
+    idr_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl QuicServer {
@@ -87,7 +87,7 @@ impl QuicServer {
     /// Use [`frame_sink`] to obtain a channel for delivering encoded frames.
     pub async fn new(
         listen_addr: SocketAddr,
-        idr_tx: tokio::sync::watch::Sender<bool>,
+        idr_tx: tokio::sync::watch::Sender<u64>,
         tuning: Arc<SenderTuning>,
     ) -> Self {
         let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(32);
@@ -249,7 +249,7 @@ async fn send_loop_to_client(
     mut video_rx: broadcast::Receiver<Arc<EncodedFrame>>,
     info: Arc<ConnectionInfo>,
     clock_offset: &AtomicI64,
-    idr_tx: watch::Sender<bool>,
+    idr_tx: watch::Sender<u64>,
     tuning: Arc<SenderTuning>,
 ) {
     let mut started = false;
@@ -274,7 +274,8 @@ async fn send_loop_to_client(
                         if !started {
                             if !frame.is_key {
                                 if !requested_initial_idr {
-                                    let _ = idr_tx.send(true);
+                                    let next = idr_tx.borrow().saturating_add(1);
+                                    let _ = idr_tx.send(next);
                                     requested_initial_idr = true;
                                     log::info!("[QUIC] Client {remote} waiting for keyframe: requested IDR");
                                 }
@@ -425,7 +426,7 @@ async fn handle_uni_stream(
     mut recv: quinn::RecvStream,
     info: Arc<ConnectionInfo>,
     clock_offset: Arc<AtomicI64>,
-    idr_tx: watch::Sender<bool>,
+    idr_tx: watch::Sender<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut len_buf = [0u8; 4];
@@ -480,7 +481,8 @@ async fn handle_uni_stream(
                 let label = info.label().await;
                 if info.should_request_idr(IDR_REQUEST_MIN_INTERVAL_MS) {
                     log::info!("[QUIC] Client {label} requested KeyFrame!");
-                    let _ = idr_tx.send(true);
+                    let next = idr_tx.borrow().saturating_add(1);
+                    let _ = idr_tx.send(next);
                 }
             }
         _ => {}
@@ -498,7 +500,7 @@ fn client_to_server_us(t: u64, clock_offset: &AtomicI64) -> u64 {
     }
 }
 
-async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &ConnectionInfo, clock_offset: &AtomicI64, idr_tx: watch::Sender<bool>,) {
+async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &ConnectionInfo, clock_offset: &AtomicI64, idr_tx: watch::Sender<u64>,) {
     if let Ok(packet) = postcard::from_bytes::<ControlPacket>(&data) {
         match packet {
             ControlPacket::Ping { client_time_us } => {
@@ -561,7 +563,8 @@ async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &Connection
                 let label = info.label().await;
                 if info.should_request_idr(IDR_REQUEST_MIN_INTERVAL_MS) {
                     log::info!("[QUIC] Client {label} requested KeyFrame!");
-                    let _ = idr_tx.send(true);
+                    let next = idr_tx.borrow().saturating_add(1);
+                    let _ = idr_tx.send(next);
                 }
             }
             _ => ()

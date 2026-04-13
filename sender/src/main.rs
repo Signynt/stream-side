@@ -136,7 +136,7 @@ async fn main() {
     );
 
     // ── Transport ────────────────────────────────────────────────────────────
-    let (idr_tx, idr_rx) = tokio::sync::watch::channel(false);
+    let (idr_tx, idr_rx) = tokio::sync::watch::channel(0u64);
     let server = Arc::new(QuicServer::new(listen_addr, idr_tx, tuning.clone()).await);
     let sink   = server.frame_sink();
 

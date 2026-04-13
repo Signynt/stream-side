@@ -81,7 +81,7 @@ use crate::SenderTuning;
 pub struct LinuxPipeWireSender {
     width:  u32,
     height: u32,
-    idr_rx: tokio::sync::watch::Receiver<bool>,
+    idr_rx: tokio::sync::watch::Receiver<u64>,
     tuning: Arc<SenderTuning>,
 }
 
@@ -90,7 +90,7 @@ impl LinuxPipeWireSender {
     pub fn new(
         width: u32,
         height: u32,
-        idr_rx: tokio::sync::watch::Receiver<bool>,
+        idr_rx: tokio::sync::watch::Receiver<u64>,
         tuning: Arc<SenderTuning>,
     ) -> Self {
         Self {
@@ -183,7 +183,7 @@ fn run_pipewire(
     width:   u32,
     height:  u32,
     sink:    mpsc::Sender<EncodedFrame>,
-    idr_rx: tokio::sync::watch::Receiver<bool>,
+    idr_rx: tokio::sync::watch::Receiver<u64>,
     tuning: Arc<SenderTuning>,
 ) -> Result<(), SenderError> {
     pw::init();
