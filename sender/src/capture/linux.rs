@@ -71,6 +71,7 @@ use crate::encode::{self, EncodedFrame};
 
 use super::SenderError;
 use super::super::encode::{AnyEncoder, HwEncoder};
+use crate::SenderTuning;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Публичный тип
@@ -80,13 +81,24 @@ use super::super::encode::{AnyEncoder, HwEncoder};
 pub struct LinuxPipeWireSender {
     width:  u32,
     height: u32,
-    idr_rx: tokio::sync::watch::Receiver<bool>
+    idr_rx: tokio::sync::watch::Receiver<bool>,
+    tuning: Arc<SenderTuning>,
 }
 
 impl LinuxPipeWireSender {
     /// Создать sender для захвата и кодирования в разрешении `width × height`.
-    pub fn new(width: u32, height: u32, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
-        Self { width, height, idr_rx }
+    pub fn new(
+        width: u32,
+        height: u32,
+        idr_rx: tokio::sync::watch::Receiver<bool>,
+        tuning: Arc<SenderTuning>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            idr_rx,
+            tuning,
+        }
     }
 }
 
@@ -121,7 +133,7 @@ impl super::VideoSender for LinuxPipeWireSender {
             .name("pipewire-capture".into())
             .spawn(move || {
                 let _guard = rt_handle.enter();
-                if let Err(e) = run_pipewire(node_id, raw_fd, width, height, sink, self.idr_rx) {
+                if let Err(e) = run_pipewire(node_id, raw_fd, width, height, sink, self.idr_rx, self.tuning) {
                     let _ = err_tx.send(e);
                 }
             })
@@ -172,6 +184,7 @@ fn run_pipewire(
     height:  u32,
     sink:    mpsc::Sender<EncodedFrame>,
     idr_rx: tokio::sync::watch::Receiver<bool>,
+    tuning: Arc<SenderTuning>,
 ) -> Result<(), SenderError> {
     pw::init();
 
@@ -204,6 +217,7 @@ fn run_pipewire(
     .map_err(|e| SenderError::CaptureInit(format!("pw stream: {e}")))?;
 
     let mut encoder: Option<AnyEncoder> = None;
+    let tuning_for_encoder = tuning.clone();
     let mut fps_counter = 0u32;
     let mut fps_tick    = std::time::Instant::now();
 
@@ -288,7 +302,7 @@ fn run_pipewire(
                 let enc = encoder.get_or_insert_with(|| {
                     log::info!("[ENCODER] Init with width {:?}, height {:?}", pw_width.get(), pw_height.get(),);
                     AnyEncoder::detect_and_create(
-                        pw_width.get(), pw_height.get(), sink.clone(), idr_rx.clone(),
+                        pw_width.get(), pw_height.get(), sink.clone(), idr_rx.clone(), tuning_for_encoder.clone(),
                     )
                 });
 
@@ -339,11 +353,12 @@ fn run_pipewire(
 
     // SPA params: on NVIDIA request CPU buffers only, because current NVENC path
     // drops DMA-BUF frames.
-    let allow_dmabuf = !matches!(common::detect_gpu_vendor(), common::GpuVendor::Nvidia);
+    let vendor = common::detect_gpu_vendor();
+    let allow_dmabuf = !matches!(vendor, common::GpuVendor::Nvidia) || tuning.allow_nvidia_dmabuf;
     if allow_dmabuf {
         log::info!("[PipeWire] DMA-BUF enabled for this GPU vendor");
     } else {
-        log::info!("[PipeWire] NVIDIA detected: requesting CPU buffers (MemPtr/MemFd), DMA-BUF disabled");
+        log::info!("[PipeWire] NVIDIA detected: requesting CPU buffers (MemPtr/MemFd), DMA-BUF disabled. Set --enable-nvidia-dmabuf to override");
     }
     let spa_format = build_spa_video_params(allow_dmabuf);
     let spa_buffers = build_spa_buffer_params(allow_dmabuf);

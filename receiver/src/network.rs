@@ -51,7 +51,10 @@ const OFFSET_ALPHA: f64 = 0.01;
 struct VideoState {
     waiting_for_key: bool,
     expected_frame_id: Option<u64>,
+    last_idr_request_us: u64,
 }
+
+const IDR_REQUEST_INTERVAL_MS: u64 = 1000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -392,6 +395,7 @@ async fn receive_datagrams<B: VideoBackend>(
     let mut video_state = VideoState {
         waiting_for_key: true,
         expected_frame_id: None,
+        last_idr_request_us: 0,
     };
     let mut jitter_buf = JitterBuffer::new(JITTER_TARGET_MS);
     let mut assembler = FrameAssembler::new();
@@ -498,6 +502,16 @@ async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
     idr_needed_tx: &watch::Sender<bool>, // To set to false on I-frame
     idr_needed_rx: &watch::Receiver<bool>,
 ) {
+    fn should_request_idr(state: &mut VideoState) -> bool {
+        let now_us = FrameTrace::now_us();
+        let min_us = IDR_REQUEST_INTERVAL_MS.saturating_mul(1_000);
+        if now_us.saturating_sub(state.last_idr_request_us) < min_us {
+            return false;
+        }
+        state.last_idr_request_us = now_us;
+        true
+    }
+
     // ── In-order / IDR gate ───────────────────────────────────────────────
     if packet.is_key {
         state.waiting_for_key   = false;
@@ -513,16 +527,23 @@ async fn push_frame_to_backend<B: VideoBackend + Send + 'static>(
 
         let tx = control_tx.clone();
         let mut rx = idr_needed_rx.clone();
+        let initial_request = should_request_idr(state);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut interval = tokio::time::interval(Duration::from_millis(IDR_REQUEST_INTERVAL_MS));
+            // Consume the immediate first tick so subsequent tick() calls wait.
+            interval.tick().await;
+
+            if initial_request {
+                let _ = tx.send(ControlPacket::RequestKeyFrame).await;
+            }
             // Loop as long as the watch value is 'true'
             while *rx.borrow() {
-                if tx.send(ControlPacket::RequestKeyFrame).await.is_err() {
-                    break;
-                }
-
                 tokio::select! {
-                    _ = interval.tick() => {},
+                    _ = interval.tick() => {
+                        if tx.send(ControlPacket::RequestKeyFrame).await.is_err() {
+                            break;
+                        }
+                    },
                     // Wake up immediately if the value changes to false
                     _ = rx.changed() => {
                         if !*rx.borrow() { break; }

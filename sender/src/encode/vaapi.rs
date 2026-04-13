@@ -39,6 +39,7 @@ use tokio::sync::mpsc as async_mpsc;
 use common::FrameTrace;
 
 use crate::encode::EncodedFrame;
+use crate::SenderTuning;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Константы DRM fourcc / modifier
@@ -51,7 +52,7 @@ const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 /// DRM_FORMAT_MOD_INVALID — драйвер сам определяет модификатор по GEM-хэндлу.
 /// Используется как fallback, когда реальный модификатор неизвестен.
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-const BITRATE: i64 = 5_000_000;
+const MIN_FORCED_IDR_INTERVAL_US: u64 = 1_000_000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Тип кадра, передаваемого в канал энкодера
 // ─────────────────────────────────────────────────────────────────────────────
@@ -102,7 +103,13 @@ impl VaapiEncoder {
     ///
     /// # Panics
     /// Паникует, если `hevc_vaapi` недоступен или VAAPI/DRM недоступны.
-    pub fn new(width: u32, height: u32, sink: async_mpsc::Sender<EncodedFrame>, idr_rx: tokio::sync::watch::Receiver<bool>) -> Self {
+    pub fn new(
+        width: u32,
+        height: u32,
+        sink: async_mpsc::Sender<EncodedFrame>,
+        idr_rx: tokio::sync::watch::Receiver<bool>,
+        tuning: Arc<SenderTuning>,
+    ) -> Self {
         let (tx, rx)             = mpsc::sync_channel::<(FrameData, u64)>(4);
         let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let (free_tx, free_rx)   = mpsc::channel::<Vec<u8>>();
@@ -117,7 +124,7 @@ impl VaapiEncoder {
         let worker = thread::Builder::new()
             .name("vaapi-encoder".into())
             .spawn(move || {
-                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone);
+                run_encoder_loop(width, height, rx, free_tx, ready_tx, sink, idr_rx_clone, tuning);
             })
             .expect("failed to spawn encoder thread");
 
@@ -242,6 +249,7 @@ fn run_encoder_loop(
     ready_tx: mpsc::Sender<()>,
     sink:     async_mpsc::Sender<EncodedFrame>,
     mut idr_rx: tokio::sync::watch::Receiver<bool>,
+    tuning: Arc<SenderTuning>,
 ) {
     // ── Инициализация кодека ─────────────────────────────────────────────────
 
@@ -251,14 +259,16 @@ fn run_encoder_loop(
     let mut enc_ctx = codec::context::Context::new_with_codec(codec);
 
     unsafe {
+        let bitrate = tuning.target_bitrate_bps.max(1);
+        let rc_buffer = (bitrate / 2).clamp(1, i32::MAX as i64) as i32;
         let raw = enc_ctx.as_mut_ptr();
         (*raw).width          = width  as i32;
         (*raw).height         = height as i32;
         (*raw).time_base      = AVRational { num: 1, den: 60 };
         (*raw).pix_fmt        = AVPixelFormat::AV_PIX_FMT_VAAPI;
-        (*raw).bit_rate       = BITRATE;
-        (*raw).rc_max_rate    = BITRATE;
-        (*raw).rc_buffer_size = BITRATE as i32 / 2;
+        (*raw).bit_rate       = bitrate;
+        (*raw).rc_max_rate    = bitrate;
+        (*raw).rc_buffer_size = rc_buffer;
         (*raw).max_b_frames   = 0;
         (*raw).delay          = 0;
         (*raw).flags         &= !(AV_CODEC_FLAG_GLOBAL_HEADER as i32);
@@ -293,9 +303,7 @@ fn run_encoder_loop(
         .open_with(opts)
         .expect("avcodec_open2 failed");
 
-    unsafe {
-        (*encoder.as_mut_ptr()).gop_size = 120;
-    }
+    unsafe { (*encoder.as_mut_ptr()).gop_size = tuning.gop_size; }
 
     // ── SwsScale для CPU-пути (BGRA → NV12) ─────────────────────────────────
 
@@ -315,6 +323,7 @@ fn run_encoder_loop(
     let mut src_frame  = Video::new(Pixel::BGRA, width, height);
     let mut nv12_frame = Video::new(Pixel::NV12, width, height);
     let mut force_idr = false;
+    let mut last_forced_idr_us = 0u64;
 
     loop {
         let (mut frame_data, mut capture_us) = match rx.recv() {
@@ -380,9 +389,16 @@ fn run_encoder_loop(
         if let Some(mut hw_frame) = hw_frame_opt {
             unsafe {
                 if force_idr {
-                    log::warn!("[Encoder] Client requested IDR. Forcing I-frame on current hardware frame.");
-                    (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_I;
-                    (*hw_frame).flags |= AV_FRAME_FLAG_KEY as i32;
+                    let now_us = FrameTrace::now_us();
+                    if now_us.saturating_sub(last_forced_idr_us) >= MIN_FORCED_IDR_INTERVAL_US {
+                        log::warn!("[Encoder] Client requested IDR. Forcing I-frame on current hardware frame.");
+                        (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_I;
+                        (*hw_frame).flags |= AV_FRAME_FLAG_KEY as i32;
+                        last_forced_idr_us = now_us;
+                    } else {
+                        (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;
+                        (*hw_frame).flags &= !(AV_FRAME_FLAG_KEY as i32);
+                    }
                     force_idr = false;
                 } else {
                     (*hw_frame).pict_type = AVPictureType::AV_PICTURE_TYPE_NONE;

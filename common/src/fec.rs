@@ -13,6 +13,9 @@ const STALE_FRAME_US: u64 = 100_000;
 
 use std::cell::RefCell;
 
+const MAX_RS_TOTAL_SHARDS: usize = 255;
+const MAX_RS_DATA_SHARDS: usize = 212;
+
 thread_local! {
     static RS_CACHE: RefCell<HashMap<(u8, u8), ReedSolomon>> = RefCell::new(HashMap::new());
 }
@@ -31,13 +34,26 @@ impl FecEncoder {
         flags: u8,
     ) -> Vec<DatagramChunk> {
 
+        if data.is_empty() || max_chunk_data == 0 {
+            return Vec::new();
+        }
+
         // Calculale k+m
-        let k = ((data.len() + max_chunk_data - 1) / max_chunk_data).max(1) as u8;
+        let k_usize = ((data.len() + max_chunk_data - 1) / max_chunk_data)
+            .max(1)
+            .min(MAX_RS_DATA_SHARDS);
 
         // Adaptive parity shards
-        let m = ((k as usize + 4) / 5).max(1) as u8;
+        let mut m_usize = ((k_usize + 4) / 5).max(1);
 
-        let shard_size = (data.len() + (k as usize) - 1) / (k as usize);
+        if k_usize + m_usize > MAX_RS_TOTAL_SHARDS {
+            m_usize = MAX_RS_TOTAL_SHARDS.saturating_sub(k_usize);
+        }
+
+        let k = k_usize as u8;
+        let m = m_usize as u8;
+
+        let shard_size = (data.len() + k_usize - 1) / k_usize;
         
         // Padding
         let mut shards: Vec<Vec<u8>> = data
@@ -53,13 +69,25 @@ impl FecEncoder {
         for _ in 0..m {
             shards.push(vec![0u8; shard_size]);
         }
+
+        let rs_key = (k, m);
+        let mut rs_encode_ok = true;
         RS_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             let rs = cache
-                .entry((k, m))
-                .or_insert_with(|| ReedSolomon::new(k as usize, m as usize).unwrap());
-            let _ = rs.encode(&mut shards);
+                .entry(rs_key)
+                .or_insert_with(|| {
+                    ReedSolomon::new(k as usize, m as usize)
+                        .expect("validated shard count for ReedSolomon::new")
+                });
+            if rs.encode(&mut shards).is_err() {
+                rs_encode_ok = false;
+            }
         });
+
+        if !rs_encode_ok {
+            return Vec::new();
+        }
 
         //Generate shards
         shards.into_iter().enumerate().map(|(shard_idx, shard_data)| {

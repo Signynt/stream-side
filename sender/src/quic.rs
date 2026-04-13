@@ -37,6 +37,36 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use common::{ControlPacket, DatagramChunk, FrameTrace, TYPE_CONTROL, TYPE_VIDEO, VideoPacket};
 use crate::{ClientIdentity, ConnectionInfo, FramePacer};
 use crate::encode::EncodedFrame;
+use crate::SenderTuning;
+
+const MAX_FEC_DATA_SHARDS: usize = 212;
+const IDR_REQUEST_MIN_INTERVAL_MS: u64 = 1000;
+
+fn split_slices_for_fec(frame: &EncodedFrame, max_chunk_data: usize) -> Vec<Bytes> {
+    // Keep k+m <= 255 for RS(galois_8), where m ~= ceil((k+4)/5).
+    // With k <= 212, m <= 43 and total stays within the supported bound.
+    let max_payload_per_slice = max_chunk_data.saturating_mul(MAX_FEC_DATA_SHARDS);
+
+    if max_payload_per_slice == 0 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for slice in &frame.slices {
+        if slice.len() <= max_payload_per_slice {
+            out.push(slice.clone());
+            continue;
+        }
+
+        let mut start = 0usize;
+        while start < slice.len() {
+            let end = (start + max_payload_per_slice).min(slice.len());
+            out.push(slice.slice(start..end));
+            start = end;
+        }
+    }
+    out
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public type
@@ -55,7 +85,11 @@ impl QuicServer {
     /// current Tokio runtime.
     ///
     /// Use [`frame_sink`] to obtain a channel for delivering encoded frames.
-    pub async fn new(listen_addr: SocketAddr, idr_tx: tokio::sync::watch::Sender<bool>) -> Self {
+    pub async fn new(
+        listen_addr: SocketAddr,
+        idr_tx: tokio::sync::watch::Sender<bool>,
+        tuning: Arc<SenderTuning>,
+    ) -> Self {
         let (frame_tx, mut frame_rx) = mpsc::channel::<EncodedFrame>(32);
 
         // broadcast capacity = 64 frames  (~1 second of 60 fps with headroom).
@@ -98,6 +132,7 @@ impl QuicServer {
             while let Some(connecting) = endpoint.accept().await {
                 let client_rx = bcast_tx.subscribe();
                 let idr_tx_init = idr_tx_clone.clone();
+                let tuning_for_conn = tuning.clone();
                 tokio::spawn(async move {
                     match connecting.await {
                         Ok(conn) => {
@@ -111,6 +146,7 @@ impl QuicServer {
                                 remote: conn.remote_address().to_string(),
                                 label: RwLock::new(conn.remote_address().to_string()),
                                 ready: AtomicBool::new(false),
+                                last_idr_request_us: std::sync::atomic::AtomicU64::new(0),
                             });
                             let info_bi = info.clone();
                             let info_uni = info.clone();
@@ -161,7 +197,14 @@ impl QuicServer {
                                     }
                                 }
                             });
-                            send_loop_to_client(conn, client_rx, info_main, &clock_off_main, ird_tx_loop).await;
+                            send_loop_to_client(
+                                conn,
+                                client_rx,
+                                info_main,
+                                &clock_off_main,
+                                ird_tx_loop,
+                                tuning_for_conn,
+                            ).await;
                         }
                         Err(e) => log::warn!("[QUIC] Handshake failed: {e}"),
                     }
@@ -207,6 +250,7 @@ async fn send_loop_to_client(
     info: Arc<ConnectionInfo>,
     clock_offset: &AtomicI64,
     idr_tx: watch::Sender<bool>,
+    tuning: Arc<SenderTuning>,
 ) {
     let mut started = false;
     let mut requested_initial_idr = false;
@@ -216,7 +260,7 @@ async fn send_loop_to_client(
     let max_dgram = conn.max_datagram_size().unwrap_or(1200);
     let max_chunk_data = max_dgram.saturating_sub(DatagramChunk::HEADER_LEN + 8);
 
-    let mut pacer = FramePacer::new(100.0, 4.0);
+    let mut pacer = FramePacer::new(tuning.pacer_rate_mbps, tuning.pacer_burst_ms);
     loop {
         tokio::select! {
             // 1. ОТПРАВКА ВИДЕО
@@ -231,7 +275,6 @@ async fn send_loop_to_client(
                             if !frame.is_key {
                                 if !requested_initial_idr {
                                     let _ = idr_tx.send(true);
-                                    let _ = idr_tx.send(false);
                                     requested_initial_idr = true;
                                     log::info!("[QUIC] Client {remote} waiting for keyframe: requested IDR");
                                 }
@@ -241,11 +284,31 @@ async fn send_loop_to_client(
                             requested_initial_idr = false;
                         }
                         
+                        if max_chunk_data == 0 {
+                            log::error!("[QUIC] max_chunk_data is zero for {remote}; dropping frame");
+                            continue;
+                        }
+
                         let flags = if frame.is_key { 1 } else { 0 };
-                        let total_slices = frame.slices.len() as u8;
+                        let fec_slices = split_slices_for_fec(&frame, max_chunk_data);
+
+                        if fec_slices.is_empty() {
+                            continue;
+                        }
+
+                        if fec_slices.len() > u8::MAX as usize {
+                            log::warn!(
+                                "[QUIC] frame {} expanded to {} FEC slices (>255), dropping",
+                                frame.frame_id,
+                                fec_slices.len()
+                            );
+                            continue;
+                        }
+
+                        let total_slices = fec_slices.len() as u8;
 
                         // Теперь итерируемся по реальным слайсам из энкодера
-                        for (s_idx, slice_data) in frame.slices.iter().enumerate() {
+                        for (s_idx, slice_data) in fec_slices.iter().enumerate() {
                             
                             // FEC энкодер теперь работает с отдельным NALU
                             let chunks = common::fec::FecEncoder::encode_slice(
@@ -415,9 +478,10 @@ async fn handle_uni_stream(
 
             ControlPacket::RequestKeyFrame => {
                 let label = info.label().await;
-                log::info!("[QUIC] Client {label} requested KeyFrame!");
-                let _ = idr_tx.send(true);
-                let _ = idr_tx.send(false);
+                if info.should_request_idr(IDR_REQUEST_MIN_INTERVAL_MS) {
+                    log::info!("[QUIC] Client {label} requested KeyFrame!");
+                    let _ = idr_tx.send(true);
+                }
             }
         _ => {}
         }
@@ -495,9 +559,10 @@ async fn handle_control(conn: &quinn::Connection, data: Bytes, info: &Connection
 
             ControlPacket::RequestKeyFrame => {
                 let label = info.label().await;
-                log::info!("[QUIC] Client {label} requested KeyFrame!");
-                let _ = idr_tx.send(true);
-                let _ = idr_tx.send(false);
+                if info.should_request_idr(IDR_REQUEST_MIN_INTERVAL_MS) {
+                    log::info!("[QUIC] Client {label} requested KeyFrame!");
+                    let _ = idr_tx.send(true);
+                }
             }
             _ => ()
         }
