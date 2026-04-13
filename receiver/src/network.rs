@@ -54,7 +54,7 @@ struct VideoState {
     last_idr_request_us: u64,
 }
 
-const IDR_REQUEST_INTERVAL_MS: u64 = 1000;
+const IDR_REQUEST_INTERVAL_MS: u64 = 2000;
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────

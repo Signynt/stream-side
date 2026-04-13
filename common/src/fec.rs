@@ -43,8 +43,15 @@ impl FecEncoder {
             .max(1)
             .min(MAX_RS_DATA_SHARDS);
 
-        // Adaptive parity shards
-        let mut m_usize = ((k_usize + 4) / 5).max(1);
+        // Adaptive parity shards:
+        // - non-keyframes: ~20% parity
+        // - keyframes:     ~50% parity for stronger recovery during large IDRs
+        let is_key = (flags & 1) != 0;
+        let mut m_usize = if is_key {
+            (k_usize / 2).max(1)
+        } else {
+            ((k_usize + 4) / 5).max(1)
+        };
 
         if k_usize + m_usize > MAX_RS_TOTAL_SHARDS {
             m_usize = MAX_RS_TOTAL_SHARDS.saturating_sub(k_usize);

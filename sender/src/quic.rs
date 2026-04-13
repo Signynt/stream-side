@@ -40,7 +40,7 @@ use crate::encode::EncodedFrame;
 use crate::SenderTuning;
 
 const MAX_FEC_DATA_SHARDS: usize = 212;
-const IDR_REQUEST_MIN_INTERVAL_MS: u64 = 1000;
+const IDR_REQUEST_MIN_INTERVAL_MS: u64 = 2000;
 
 fn split_slices_for_fec(frame: &EncodedFrame, max_chunk_data: usize) -> Vec<Bytes> {
     // Keep k+m <= 255 for RS(galois_8), where m ~= ceil((k+4)/5).
@@ -261,6 +261,9 @@ async fn send_loop_to_client(
     let max_chunk_data = max_dgram.saturating_sub(DatagramChunk::HEADER_LEN + 8);
 
     let mut pacer = FramePacer::new(tuning.pacer_rate_mbps, tuning.pacer_burst_ms);
+    let keyframe_rate_mbps = tuning.pacer_rate_mbps.min(120.0);
+    let keyframe_burst_ms = tuning.pacer_burst_ms.min(1.5);
+    let mut keyframe_pacer = FramePacer::new(keyframe_rate_mbps, keyframe_burst_ms);
     loop {
         tokio::select! {
             // 1. ОТПРАВКА ВИДЕО
@@ -323,7 +326,11 @@ async fn send_loop_to_client(
 
                             for chunk in chunks {
                                 // Pacer считает нагрузку на сеть
-                                let wait = pacer.consume(DatagramChunk::HEADER_LEN + chunk.data.len());
+                                let wait = if frame.is_key {
+                                    keyframe_pacer.consume(DatagramChunk::HEADER_LEN + chunk.data.len())
+                                } else {
+                                    pacer.consume(DatagramChunk::HEADER_LEN + chunk.data.len())
+                                };
                                 if !wait.is_zero() {
                                     tokio::time::sleep(wait).await;
                                 }
