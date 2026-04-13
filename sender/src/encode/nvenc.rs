@@ -206,7 +206,6 @@ fn run_encoder_loop(
     opts.set("gpu", "0");
     opts.set("async_depth",   "1");
     opts.set("low_delay_brc", "1");
-    opts.set("intra-refresh", "1");
 
     // VAAPI + DRM: создаём оба контекста через единый DRM-девайс.
     // ВАЖНО: VAAPI должен быть ПРОИЗВОДНЫМ от DRM-девайса, чтобы оба контекста

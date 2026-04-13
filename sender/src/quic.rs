@@ -209,6 +209,7 @@ async fn send_loop_to_client(
     idr_tx: watch::Sender<bool>,
 ) {
     let mut started = false;
+    let mut requested_initial_idr = false;
     let remote = conn.remote_address();
     
     // Заранее считаем лимиты
@@ -227,8 +228,17 @@ async fn send_loop_to_client(
                         }
 
                         if !started {
-                            if !frame.is_key { continue; }
+                            if !frame.is_key {
+                                if !requested_initial_idr {
+                                    let _ = idr_tx.send(true);
+                                    let _ = idr_tx.send(false);
+                                    requested_initial_idr = true;
+                                    log::info!("[QUIC] Client {remote} waiting for keyframe: requested IDR");
+                                }
+                                continue;
+                            }
                             started = true;
+                            requested_initial_idr = false;
                         }
                         
                         let flags = if frame.is_key { 1 } else { 0 };

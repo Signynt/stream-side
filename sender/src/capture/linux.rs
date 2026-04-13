@@ -337,9 +337,16 @@ fn run_pipewire(
         .register()
         .map_err(|e| SenderError::CaptureInit(format!("pw listener: {e}")))?;
 
-    // SPA params: запрашиваем BGRA + разрешаем DmaBuf.
-    let spa_format = build_spa_video_params();
-    let spa_buffers = build_spa_buffer_params();
+    // SPA params: on NVIDIA request CPU buffers only, because current NVENC path
+    // drops DMA-BUF frames.
+    let allow_dmabuf = !matches!(common::detect_gpu_vendor(), common::GpuVendor::Nvidia);
+    if allow_dmabuf {
+        log::info!("[PipeWire] DMA-BUF enabled for this GPU vendor");
+    } else {
+        log::info!("[PipeWire] NVIDIA detected: requesting CPU buffers (MemPtr/MemFd), DMA-BUF disabled");
+    }
+    let spa_format = build_spa_video_params(allow_dmabuf);
+    let spa_buffers = build_spa_buffer_params(allow_dmabuf);
     
     let mut params = [
         pw::spa::pod::Pod::from_bytes(&spa_format)
@@ -370,7 +377,7 @@ fn run_pipewire(
 /// PipeWire будет предпочитать DmaBuf если compositor его поддерживает
 /// (Wayland compositor с linux-dmabuf-unstable-v1), и автоматически
 /// падать back на MemFd/MemPtr если нет.
-fn build_spa_video_params() -> Vec<u8> {
+fn build_spa_video_params(allow_dmabuf: bool) -> Vec<u8> {
     use pw::spa::pod::serialize::PodSerializer;
     use pw::spa::sys::*;
 
@@ -392,8 +399,7 @@ fn build_spa_video_params() -> Vec<u8> {
         },
     ];
 
-    // Here we specifically ask for DMA frames. NVIDIA currently doesn't eat those.
-    if matches!(common::detect_gpu_vendor(), common::GpuVendor::Amd) {
+    if allow_dmabuf {
         properties.push(pw::spa::pod::Property {
             key:   SPA_FORMAT_VIDEO_modifier,
             flags: PropertyFlags::empty(),
@@ -413,9 +419,18 @@ fn build_spa_video_params() -> Vec<u8> {
 }
 
 // НОВАЯ ФУНКЦИЯ: Жестко требуем от PipeWire присылать именно DMA-BUF
-fn build_spa_buffer_params() -> Vec<u8> {
+fn build_spa_buffer_params(allow_dmabuf: bool) -> Vec<u8> {
     use pw::spa::pod::serialize::PodSerializer;
     use pw::spa::sys::*;
+
+    let data_type_mask = if allow_dmabuf {
+        (1 << (SPA_DATA_DmaBuf as i32)) |
+        (1 << (SPA_DATA_MemPtr as i32)) |
+        (1 << (SPA_DATA_MemFd as i32))
+    } else {
+        (1 << (SPA_DATA_MemPtr as i32)) |
+        (1 << (SPA_DATA_MemFd as i32))
+    };
 
     let value = pw::spa::pod::Value::Object(pw::spa::pod::Object {
         type_: SPA_TYPE_OBJECT_ParamBuffers,
@@ -424,12 +439,7 @@ fn build_spa_buffer_params() -> Vec<u8> {
             pw::spa::pod::Property {
                 key:   SPA_PARAM_BUFFERS_dataType,
                 flags: PropertyFlags::empty(),
-                // Устанавливаем битовую маску, разрешающую ТОЛЬКО DmaBuf
-                value: pw::spa::pod::Value::Int(
-                    (1 << (SPA_DATA_DmaBuf as i32)) | 
-                    (1 << (SPA_DATA_MemPtr as i32)) |
-                    (1 << (SPA_DATA_MemFd as i32))
-                ),
+                value: pw::spa::pod::Value::Int(data_type_mask),
             },
         ],
     });
